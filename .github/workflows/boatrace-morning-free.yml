@@ -8,30 +8,98 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
+
+concurrency:
+  group: boatrace-morning-free
+  cancel-in-progress: false
 
 jobs:
   oidc-probe:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
       - name: Verify GitHub OIDC access to Neon Data API
         shell: bash
         env:
           DATA_API_URL: https://ep-weathered-cloud-ax67iew3.apirest.c-4.us-east-2.aws.neon.tech/neondb/rest/v1
           OIDC_AUDIENCE: neon-boatrace-morning-free
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          mkdir -p ops/boatrace-morning-free
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          overall=FAIL
+          http_status=000
+          error_code='OIDC_TOKEN_UNAVAILABLE'
+          response='{}'
+
           token_response="$(curl -fsS \
             -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
-          jwt="$(jq -er '.value' <<<"$token_response")"
-          response="$(curl -fsS --fail-with-body \
-            -X POST \
-            -H "Authorization: Bearer ${jwt}" \
-            -H 'Content-Type: application/json' \
-            "${DATA_API_URL}/rpc/boatrace_oidc_probe" \
-            -d '{}')"
-          jq -e '.ok == true' <<<"$response"
-          jq '{ok, repository, repository_id, ref, workflow_ref, event_name, run_id, actor_id}' <<<"$response"
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" 2>/tmp/token-error.log)"
+          token_rc=$?
+          if [ "$token_rc" -eq 0 ]; then
+            jwt="$(jq -er '.value' <<<"$token_response" 2>/tmp/token-parse-error.log)"
+            jwt_rc=$?
+            if [ "$jwt_rc" -eq 0 ]; then
+              http_status="$(curl -sS \
+                -o /tmp/probe-response.json \
+                -w '%{http_code}' \
+                -X POST \
+                -H "Authorization: Bearer ${jwt}" \
+                -H 'Content-Type: application/json' \
+                "${DATA_API_URL}/rpc/boatrace_oidc_probe" \
+                -d '{}')"
+              response="$(cat /tmp/probe-response.json 2>/dev/null || printf '{}')"
+              if [ "$http_status" = 200 ] && jq -e '.ok == true' <<<"$response" >/dev/null 2>&1; then
+                overall=PASS
+                error_code=''
+              else
+                error_code='DATA_API_PROBE_REJECTED'
+              fi
+            else
+              error_code='OIDC_TOKEN_PARSE_FAILED'
+            fi
+          fi
+
+          export started_at overall http_status error_code response
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          try:
+              body = json.loads(os.environ.get('response') or '{}')
+          except Exception:
+              body = {'error': 'NON_JSON_RESPONSE'}
+          result = {
+              'schema_version': 'boatrace-oidc-probe-v1',
+              'started_at_utc': os.environ['started_at'],
+              'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
+              'overall': os.environ['overall'],
+              'http_status': int(os.environ['http_status']) if os.environ['http_status'].isdigit() else 0,
+              'error_code': os.environ.get('error_code') or None,
+              'validated_claims': body if body.get('ok') is True else None,
+              'server_error': body if body.get('ok') is not True else None,
+              'jwt_persisted': False,
+              'database_secret_used': False,
+          }
+          Path('ops/boatrace-morning-free/oidc-probe.json').write_text(
+              json.dumps(result, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ops/boatrace-morning-free/oidc-probe.json
+          git commit -m "Record BOAT RACE OIDC probe ${overall}" || true
+          git pull --rebase origin main
+          git push origin HEAD:main
+
+          [ "$overall" = PASS ]
