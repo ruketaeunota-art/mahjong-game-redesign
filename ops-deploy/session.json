@@ -1,10 +1,10 @@
 {
   "schema_version": "boatrace-secure-deploy-session-v1",
   "status": "WAITING_FOR_AUTH_AND_ENCRYPTED_PAYLOAD",
-  "created_at_utc": "2026-08-23T15:04:49.017660+00:00",
-  "expires_at_utc": "2026-08-23T15:11:49.017660+00:00",
+  "created_at_utc": "2026-08-23T15:14:46.600923+00:00",
+  "expires_at_utc": "2026-08-23T15:21:46.600923+00:00",
   "verification_uri": "https://dash.cloudflare.com/oauth2/device/verify",
-  "verification_uri_complete": "https://dash.cloudflare.com/oauth2/device/verify?user_code=3NArsh7V",
-  "user_code": "3NArsh7V",
+  "verification_uri_complete": "https://dash.cloudflare.com/oauth2/device/verify?user_code=MYeXtAtQ",
+  "user_code": "MYeXtAtQ",
   "workflow_run_id": "32647403639"
 }
