@@ -1,0 +1,17 @@
+{
+  "schema_version": "boatrace-oidc-probe-v1",
+  "started_at_utc": "2026-08-23T15:29:00Z",
+  "recorded_at_utc": "2026-08-23T15:29:10.261351+00:00",
+  "overall": "FAIL",
+  "http_status": 403,
+  "error_code": "DATA_API_PROBE_REJECTED",
+  "validated_claims": null,
+  "server_error": {
+    "code": "42501",
+    "message": "permission denied for function boatrace_oidc_probe",
+    "details": null,
+    "hint": null
+  },
+  "jwt_persisted": false,
+  "database_secret_used": false
+}
