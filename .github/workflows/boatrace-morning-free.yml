@@ -103,3 +103,5 @@ jobs:
           git push origin HEAD:main
 
           [ "$overall" = PASS ]
+
+# probe retry after anonymous-role RPC grant: 2026-08-24 JST
