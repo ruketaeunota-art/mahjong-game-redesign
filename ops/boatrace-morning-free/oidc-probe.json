@@ -1,17 +1,21 @@
 {
   "schema_version": "boatrace-oidc-probe-v1",
-  "started_at_utc": "2026-08-23T15:29:00Z",
-  "recorded_at_utc": "2026-08-23T15:29:10.261351+00:00",
-  "overall": "FAIL",
-  "http_status": 403,
-  "error_code": "DATA_API_PROBE_REJECTED",
-  "validated_claims": null,
-  "server_error": {
-    "code": "42501",
-    "message": "permission denied for function boatrace_oidc_probe",
-    "details": null,
-    "hint": null
+  "started_at_utc": "2026-08-23T15:30:30Z",
+  "recorded_at_utc": "2026-08-23T15:30:35.721532+00:00",
+  "overall": "PASS",
+  "http_status": 200,
+  "error_code": null,
+  "validated_claims": {
+    "ok": true,
+    "ref": "refs/heads/main",
+    "run_id": "32648760190",
+    "actor_id": "265415463",
+    "event_name": "push",
+    "repository": "ruketaeunota-art/mahjong-game-redesign",
+    "workflow_ref": "ruketaeunota-art/mahjong-game-redesign/.github/workflows/boatrace-morning-free.yml@refs/heads/main",
+    "repository_id": "1173463928"
   },
+  "server_error": null,
   "jwt_persisted": false,
   "database_secret_used": false
 }
