@@ -1,0 +1,289 @@
+name: Secure deploy BOAT RACE Morning Free
+
+on:
+  push:
+    branches:
+      - ops/boatrace-free-deploy-20260823
+    paths:
+      - .github/workflows/boatrace-free-secure-deploy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: boatrace-free-secure-deploy
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: 0b518be7b875d0556c0ebab83cc50e0c
+  DEPLOY_BRANCH: ops/boatrace-free-deploy-20260823
+  WORKER_NAME: boatrace-morning-free
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout ephemeral deploy branch
+        uses: actions/checkout@v4
+        with:
+          ref: ops/boatrace-free-deploy-20260823
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Generate ephemeral certificate and start Cloudflare device login
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ops-deploy
+          rm -f ops-deploy/session.json ops-deploy/deploy-cert.pem /tmp/deploy-private.pem /tmp/wrangler-device.log
+
+          openssl req -x509 -newkey rsa:4096 \
+            -keyout /tmp/deploy-private.pem \
+            -out ops-deploy/deploy-cert.pem \
+            -sha256 -days 1 -nodes \
+            -subj '/CN=boatrace-free-deploy-ephemeral'
+          chmod 600 /tmp/deploy-private.pem
+
+          (
+            npx --yes wrangler@4 login --device --browser=false --no-use-keyring
+          ) > /tmp/wrangler-device.log 2>&1 &
+          login_pid=$!
+          echo "$login_pid" > /tmp/wrangler-login.pid
+
+          verification_uri=''
+          user_code=''
+          for attempt in $(seq 1 120); do
+            readarray -t parsed < <(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('/tmp/wrangler-device.log').read_text(errors='replace') if Path('/tmp/wrangler-device.log').exists() else ''
+          text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+          uri = re.search(r'To authorize .*?please visit:\s*\n\s*(https://[^\s]+)', text, re.S)
+          code = re.search(r'and enter the code:\s*\n\s*([A-Za-z0-9-]+)', text, re.S)
+          print(uri.group(1).rstrip(').,') if uri else '')
+          print(code.group(1) if code else '')
+          PY
+          )
+            verification_uri="${parsed[0]:-}"
+            user_code="${parsed[1]:-}"
+            if [ -n "$verification_uri" ] && [ -n "$user_code" ]; then break; fi
+            if ! kill -0 "$login_pid" 2>/dev/null; then
+              cat /tmp/wrangler-device.log
+              exit 31
+            fi
+            sleep 1
+          done
+          test -n "$verification_uri" || { cat /tmp/wrangler-device.log; exit 32; }
+          test -n "$user_code" || { cat /tmp/wrangler-device.log; exit 33; }
+
+          VERIFICATION_URI="$verification_uri" USER_CODE="$user_code" python - <<'PY'
+          import json, os
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+          now = datetime.now(timezone.utc)
+          uri = os.environ['VERIFICATION_URI']
+          code = os.environ['USER_CODE']
+          sep = '&' if '?' in uri else '?'
+          payload = {
+              'schema_version': 'boatrace-secure-deploy-session-v1',
+              'status': 'WAITING_FOR_AUTH_AND_ENCRYPTED_PAYLOAD',
+              'created_at_utc': now.isoformat(),
+              'expires_at_utc': (now + timedelta(minutes=7)).isoformat(),
+              'verification_uri': uri,
+              'verification_uri_complete': uri + sep + urlencode({'user_code': code}),
+              'user_code': code,
+              'workflow_run_id': os.environ['GITHUB_RUN_ID'],
+          }
+          Path('ops-deploy/session.json').write_text(json.dumps(payload, indent=2) + '\n')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ops-deploy/deploy-cert.pem ops-deploy/session.json
+          git commit -m 'Open encrypted Cloudflare deployment session'
+          git push origin HEAD:"$DEPLOY_BRANCH"
+
+      - name: Receive and decrypt private deployment payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=false
+          for attempt in $(seq 1 180); do
+            git fetch origin "$DEPLOY_BRANCH" --quiet
+            if git cat-file -e "origin/$DEPLOY_BRANCH:ops-deploy/payload.cms.b64" 2>/dev/null && \
+               git cat-file -e "origin/$DEPLOY_BRANCH:ops-deploy/payload.sha256" 2>/dev/null; then
+              git show "origin/$DEPLOY_BRANCH:ops-deploy/payload.cms.b64" > /tmp/payload.cms.b64
+              git show "origin/$DEPLOY_BRANCH:ops-deploy/payload.sha256" > /tmp/payload.sha256
+              found=true
+              break
+            fi
+            sleep 2
+          done
+          [ "$found" = true ] || exit 40
+
+          base64 --decode /tmp/payload.cms.b64 > /tmp/payload.cms
+          expected="$(tr -d '[:space:]' < /tmp/payload.sha256)"
+          actual="$(sha256sum /tmp/payload.cms | awk '{print $1}')"
+          [ "$expected" = "$actual" ] || exit 41
+
+          openssl cms -decrypt -binary -inform DER \
+            -in /tmp/payload.cms \
+            -recip ops-deploy/deploy-cert.pem \
+            -inkey /tmp/deploy-private.pem \
+            -out /tmp/payload.json
+          jq -e '.database_url and .admin_trigger_token and (.files | length > 0)' /tmp/payload.json >/dev/null
+
+      - name: Complete Cloudflare authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          login_pid="$(cat /tmp/wrangler-login.pid)"
+          if ! wait "$login_pid"; then
+            cat /tmp/wrangler-device.log
+            exit 50
+          fi
+          cat /tmp/wrangler-device.log
+          grep -Eiq 'success|logged in|authorization' /tmp/wrangler-device.log
+          npx --yes wrangler@4 whoami
+
+      - name: Materialize and validate private source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/boatrace-private
+          mkdir -p /tmp/boatrace-private
+          python - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+          payload = json.load(open('/tmp/payload.json', encoding='utf-8'))
+          root = pathlib.Path('/tmp/boatrace-private')
+          for item in payload['files']:
+              rel = pathlib.PurePosixPath(item['path'])
+              if rel.is_absolute() or '..' in rel.parts:
+                  raise SystemExit(f'unsafe path: {rel}')
+              dest = root.joinpath(*rel.parts)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              req = urllib.request.Request(item['url'], headers={'User-Agent': 'boatrace-secure-deploy/1.0'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  data = response.read()
+              actual = hashlib.sha256(data).hexdigest()
+              if actual != item['sha256']:
+                  raise SystemExit(f'hash mismatch: {rel}: {actual}')
+              dest.write_bytes(data)
+          PY
+
+          cd /tmp/boatrace-private/boatrace_morning_free
+          node scripts/build.mjs
+          node --test test/*.test.mjs
+          npm run check
+          sha256sum -c dist/SHA256SUMS
+          test "$(cat version.txt)" = 'v1.0.0-free-20260823'
+          jq -e '.name == "boatrace-morning-free" and .main == "dist/index.js" and (.triggers.crons == ["* * * * *"])' wrangler.jsonc >/dev/null
+
+      - name: Bootstrap, set encrypted secrets, and deploy production Worker
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/boatrace-private/boatrace_morning_free
+          cp wrangler.jsonc /tmp/wrangler.final.jsonc
+          jq '.vars.MORNING_ENABLED = "false"' /tmp/wrangler.final.jsonc > wrangler.jsonc
+
+          npx --yes wrangler@4 deploy 2>&1 | tee /tmp/bootstrap-deploy.log
+
+          database_url="$(jq -r '.database_url' /tmp/payload.json)"
+          admin_token="$(jq -r '.admin_trigger_token' /tmp/payload.json)"
+          printf '%s' "$database_url" | npx --yes wrangler@4 secret put DATABASE_URL
+          printf '%s' "$admin_token" | npx --yes wrangler@4 secret put ADMIN_TRIGGER_TOKEN
+
+          cp /tmp/wrangler.final.jsonc wrangler.jsonc
+          npx --yes wrangler@4 deploy --keep-vars 2>&1 | tee /tmp/final-deploy.log
+          version_id="$(sed -nE 's/.*Current Version ID: ([0-9a-f-]{36}).*/\1/p' /tmp/final-deploy.log | tail -1)"
+          echo "version_id=${version_id:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify health and run current EARLY E2E
+        id: e2e
+        shell: bash
+        run: |
+          set -euo pipefail
+          base='https://boatrace-morning-free.ruketaeunota.workers.dev'
+          admin_token="$(jq -r '.admin_trigger_token' /tmp/payload.json)"
+          target_date="$(jq -r '.target_date' /tmp/payload.json)"
+
+          healthy=false
+          for attempt in $(seq 1 12); do
+            code="$(curl -sS --max-time 20 -o /tmp/health.json -w '%{http_code}' "$base/health" || true)"
+            if [ "$code" = 200 ] && jq -e '.status == "ok" and .enabled == true and .version == "v1.0.0-free-20260823"' /tmp/health.json >/dev/null; then
+              healthy=true
+              break
+            fi
+            sleep 5
+          done
+          [ "$healthy" = true ] || { cat /tmp/health.json || true; exit 60; }
+
+          curl -sS --fail-with-body --max-time 30 \
+            -X POST -H "Authorization: Bearer $admin_token" \
+            "$base/admin/start?stage=EARLY&target_date=$target_date" \
+            | tee /tmp/start.json
+
+          final_status='IN_PROGRESS'
+          last='{}'
+          for attempt in $(seq 1 120); do
+            last="$(curl -sS --fail-with-body --max-time 30 \
+              -X POST -H "Authorization: Bearer $admin_token" \
+              "$base/admin/tick?stage=EARLY&target_date=$target_date")"
+            printf '%s\n' "$last" > /tmp/last-tick.json
+            status="$(jq -r '.status // "UNKNOWN"' /tmp/last-tick.json)"
+            echo "tick=$attempt status=$status"
+            if [ "$status" = SUCCEEDED ] || [ "$status" = IDLE ]; then
+              final_status="$status"
+              break
+            fi
+            sleep 1
+          done
+          echo "final_status=$final_status" >> "$GITHUB_OUTPUT"
+          [ "$final_status" = SUCCEEDED ] || [ "$final_status" = IDLE ]
+
+      - name: Publish sanitized deployment result and remove exchange material
+        shell: bash
+        env:
+          DEPLOYED_VERSION_ID: ${{ steps.deploy.outputs.version_id }}
+          E2E_FINAL_STATUS: ${{ steps.e2e.outputs.final_status }}
+        run: |
+          set -euo pipefail
+          target_date="$(jq -r '.target_date' /tmp/payload.json)"
+          git fetch origin "$DEPLOY_BRANCH"
+          git checkout -B "$DEPLOY_BRANCH" "origin/$DEPLOY_BRANCH"
+          rm -f ops-deploy/deploy-cert.pem ops-deploy/session.json ops-deploy/payload.cms.b64 ops-deploy/payload.sha256
+          mkdir -p ops-deploy
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          result = {
+              'schema_version': 'boatrace-morning-free-deploy-result-v1',
+              'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
+              'overall': 'PASS',
+              'worker': os.environ['WORKER_NAME'],
+              'cloudflare_account_id': os.environ['CLOUDFLARE_ACCOUNT_ID'],
+              'cloudflare_version_id': os.environ.get('DEPLOYED_VERSION_ID'),
+              'service_version': 'v1.0.0-free-20260823',
+              'target_date': os.environ['TARGET_DATE'],
+              'health': 'PASS',
+              'e2e_final_status': os.environ.get('E2E_FINAL_STATUS'),
+              'private_payload_removed': True,
+              'automatic_purchase': False,
+          }
+          Path('ops-deploy/result.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+          git add -A ops-deploy
+          git commit -m 'Record BOAT RACE Morning Free production deployment'
+          git push origin HEAD:"$DEPLOY_BRANCH"
+        env:
+          TARGET_DATE: ${{ fromJSON(steps.e2e.outputs.target_date || '"2026-08-23"') }}
