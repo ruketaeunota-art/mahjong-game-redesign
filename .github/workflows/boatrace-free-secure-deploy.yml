@@ -36,12 +36,20 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Generate ephemeral certificate and start Cloudflare device login
+      - name: Open encrypted exchange and authenticate Cloudflare
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ops-deploy
-          rm -f ops-deploy/session.json ops-deploy/deploy-cert.pem /tmp/deploy-private.pem /tmp/wrangler-device.log
+          rm -f \
+            ops-deploy/session.json \
+            ops-deploy/deploy-cert.pem \
+            ops-deploy/payload.cms.b64 \
+            ops-deploy/payload.sha256 \
+            /tmp/deploy-private.pem \
+            /tmp/wrangler-device.log \
+            /tmp/payload.cms \
+            /tmp/payload.json
 
           openssl req -x509 -newkey rsa:4096 \
             -keyout /tmp/deploy-private.pem \
@@ -54,7 +62,6 @@ jobs:
             npx --yes wrangler@4 login --device --browser=false --no-use-keyring
           ) > /tmp/wrangler-device.log 2>&1 &
           login_pid=$!
-          echo "$login_pid" > /tmp/wrangler-login.pid
 
           verification_uri=''
           user_code=''
@@ -110,12 +117,8 @@ jobs:
           git commit -m 'Open encrypted Cloudflare deployment session'
           git push origin HEAD:"$DEPLOY_BRANCH"
 
-      - name: Receive and decrypt private deployment payload
-        shell: bash
-        run: |
-          set -euo pipefail
           found=false
-          for attempt in $(seq 1 180); do
+          for attempt in $(seq 1 210); do
             git fetch origin "$DEPLOY_BRANCH" --quiet
             if git cat-file -e "origin/$DEPLOY_BRANCH:ops-deploy/payload.cms.b64" 2>/dev/null && \
                git cat-file -e "origin/$DEPLOY_BRANCH:ops-deploy/payload.sha256" 2>/dev/null; then
@@ -123,6 +126,10 @@ jobs:
               git show "origin/$DEPLOY_BRANCH:ops-deploy/payload.sha256" > /tmp/payload.sha256
               found=true
               break
+            fi
+            if ! kill -0 "$login_pid" 2>/dev/null; then
+              cat /tmp/wrangler-device.log
+              exit 34
             fi
             sleep 2
           done
@@ -140,11 +147,6 @@ jobs:
             -out /tmp/payload.json
           jq -e '.database_url and .admin_trigger_token and (.files | length > 0)' /tmp/payload.json >/dev/null
 
-      - name: Complete Cloudflare authorization
-        shell: bash
-        run: |
-          set -euo pipefail
-          login_pid="$(cat /tmp/wrangler-login.pid)"
           if ! wait "$login_pid"; then
             cat /tmp/wrangler-device.log
             exit 50
@@ -160,7 +162,7 @@ jobs:
           rm -rf /tmp/boatrace-private
           mkdir -p /tmp/boatrace-private
           python - <<'PY'
-          import hashlib, json, os, pathlib, urllib.request
+          import hashlib, json, pathlib, urllib.request
           payload = json.load(open('/tmp/payload.json', encoding='utf-8'))
           root = pathlib.Path('/tmp/boatrace-private')
           for item in payload['files']:
@@ -233,12 +235,11 @@ jobs:
             | tee /tmp/start.json
 
           final_status='IN_PROGRESS'
-          last='{}'
           for attempt in $(seq 1 120); do
-            last="$(curl -sS --fail-with-body --max-time 30 \
+            curl -sS --fail-with-body --max-time 30 \
               -X POST -H "Authorization: Bearer $admin_token" \
-              "$base/admin/tick?stage=EARLY&target_date=$target_date")"
-            printf '%s\n' "$last" > /tmp/last-tick.json
+              "$base/admin/tick?stage=EARLY&target_date=$target_date" \
+              > /tmp/last-tick.json
             status="$(jq -r '.status // "UNKNOWN"' /tmp/last-tick.json)"
             echo "tick=$attempt status=$status"
             if [ "$status" = SUCCEEDED ] || [ "$status" = IDLE ]; then
@@ -255,9 +256,9 @@ jobs:
         env:
           DEPLOYED_VERSION_ID: ${{ steps.deploy.outputs.version_id }}
           E2E_FINAL_STATUS: ${{ steps.e2e.outputs.final_status }}
+          TARGET_DATE: '2026-08-23'
         run: |
           set -euo pipefail
-          target_date="$(jq -r '.target_date' /tmp/payload.json)"
           git fetch origin "$DEPLOY_BRANCH"
           git checkout -B "$DEPLOY_BRANCH" "origin/$DEPLOY_BRANCH"
           rm -f ops-deploy/deploy-cert.pem ops-deploy/session.json ops-deploy/payload.cms.b64 ops-deploy/payload.sha256
@@ -285,5 +286,3 @@ jobs:
           git add -A ops-deploy
           git commit -m 'Record BOAT RACE Morning Free production deployment'
           git push origin HEAD:"$DEPLOY_BRANCH"
-        env:
-          TARGET_DATE: ${{ fromJSON(steps.e2e.outputs.target_date || '"2026-08-23"') }}
