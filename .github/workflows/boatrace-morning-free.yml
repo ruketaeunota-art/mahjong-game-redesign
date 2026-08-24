@@ -1,95 +1,226 @@
-name: BOAT RACE Morning Free
+name: BOAT RACE Morning Free Production
 
 on:
+  schedule:
+    - cron: '0 22 * * *'   # 07:00 JST EARLY
+    - cron: '30 23 * * *'  # 08:30 JST LATE
   push:
     branches: [main]
     paths:
       - '.github/workflows/boatrace-morning-free.yml'
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: YYYY-MM-DD JST
+        required: false
+        type: string
+      stage:
+        description: EARLY or LATE
+        required: false
+        type: choice
+        options: [EARLY, LATE]
 
 permissions:
   contents: write
   id-token: write
 
 concurrency:
-  group: boatrace-morning-free
+  group: boatrace-morning-free-production
   cancel-in-progress: false
 
+env:
+  DATA_API_URL: https://ep-weathered-cloud-ax67iew3.apirest.c-4.us-east-2.aws.neon.tech/neondb/rest/v1
+  OIDC_AUDIENCE: neon-boatrace-morning-free
+  RUNTIME_DIR: ops/boatrace-morning-free/runtime
+
 jobs:
-  oidc-probe:
+  production:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 35
     steps:
-      - name: Checkout
+      - name: Checkout production runtime
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Verify GitHub OIDC access to Neon Data API
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ops/boatrace-morning-free/runtime/requirements.txt
+
+      - name: Resolve target date and stage
+        id: context
         shell: bash
         env:
-          DATA_API_URL: https://ep-weathered-cloud-ax67iew3.apirest.c-4.us-east-2.aws.neon.tech/neondb/rest/v1
-          OIDC_AUDIENCE: neon-boatrace-morning-free
+          INPUT_DATE: ${{ inputs.target_date }}
+          INPUT_STAGE: ${{ inputs.stage }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          set -uo pipefail
-          mkdir -p ops/boatrace-morning-free
-          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          overall=FAIL
-          http_status=000
-          error_code='OIDC_TOKEN_UNAVAILABLE'
-          response='{}'
+          set -euo pipefail
+          target="${INPUT_DATE:-}"
+          stage="${INPUT_STAGE:-}"
+          if [ -z "$target" ]; then target="$(TZ=Asia/Tokyo date +%F)"; fi
+          if [ -z "$stage" ]; then
+            case "${EVENT_SCHEDULE:-}" in
+              '30 23 * * *') stage=LATE ;;
+              *) stage=EARLY ;;
+            esac
+          fi
+          [[ "$target" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          [[ "$stage" = EARLY || "$stage" = LATE ]]
+          echo "target_date=$target" >> "$GITHUB_OUTPUT"
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+          echo "TARGET_DATE=$target" >> "$GITHUB_ENV"
+          echo "MORNING_STAGE=$stage" >> "$GITHUB_ENV"
 
+      - name: Acquire short-lived Neon database lease with GitHub OIDC
+        id: lease
+        shell: bash
+        run: |
+          set -euo pipefail
           token_response="$(curl -fsS \
             -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" 2>/tmp/token-error.log)"
-          token_rc=$?
-          if [ "$token_rc" -eq 0 ]; then
-            jwt="$(jq -er '.value' <<<"$token_response" 2>/tmp/token-parse-error.log)"
-            jwt_rc=$?
-            if [ "$jwt_rc" -eq 0 ]; then
-              http_status="$(curl -sS \
-                -o /tmp/probe-response.json \
-                -w '%{http_code}' \
-                -X POST \
-                -H "Authorization: Bearer ${jwt}" \
-                -H 'Content-Type: application/json' \
-                "${DATA_API_URL}/rpc/boatrace_oidc_probe" \
-                -d '{}')"
-              response="$(cat /tmp/probe-response.json 2>/dev/null || printf '{}')"
-              if [ "$http_status" = 200 ] && jq -e '.ok == true' <<<"$response" >/dev/null 2>&1; then
-                overall=PASS
-                error_code=''
-              else
-                error_code='DATA_API_PROBE_REJECTED'
-              fi
-            else
-              error_code='OIDC_TOKEN_PARSE_FAILED'
-            fi
-          fi
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          jwt="$(jq -er '.value' <<<"$token_response")"
+          echo "::add-mask::$jwt"
 
-          export started_at overall http_status error_code response
+          curl -sS --fail-with-body \
+            -o /tmp/db-lease.json \
+            -X POST \
+            -H "Authorization: Bearer ${jwt}" \
+            -H 'Content-Type: application/json' \
+            "${DATA_API_URL}/rpc/boatrace_oidc_issue_db_lease" \
+            -d '{}'
+
+          jq -e '.ok == true and (.database_url | type == "string")' /tmp/db-lease.json >/dev/null
+          database_url="$(jq -er '.database_url' /tmp/db-lease.json)"
+          expires_at="$(jq -er '.expires_at' /tmp/db-lease.json)"
+          database_password="$(DATABASE_URL_VALUE="$database_url" python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          print(urlparse(os.environ['DATABASE_URL_VALUE']).password or '')
+          PY
+          )"
+          echo "::add-mask::$database_url"
+          if [ -n "$database_password" ]; then echo "::add-mask::$database_password"; fi
+          echo "DATABASE_URL=$database_url" >> "$GITHUB_ENV"
+          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+          rm -f /tmp/db-lease.json
+
+      - name: Install exact production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            --requirement "$RUNTIME_DIR/requirements.txt"
+
+      - name: Skip an already successful logical stage
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          already="$(python - <<'PY'
+          import os
+          import psycopg
+          with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+              with conn.cursor() as cur:
+                  cur.execute('''
+                      SELECT EXISTS (
+                          SELECT 1
+                            FROM ux_app.run_executions r
+                            JOIN LATERAL (
+                                SELECT lifecycle_status
+                                  FROM ux_app.run_events
+                                 WHERE run_execution_id = r.id
+                                 ORDER BY event_seq DESC
+                                 LIMIT 1
+                            ) e ON true
+                           WHERE r.target_date = %s::date
+                             AND r.stage = %s::text
+                             AND e.lifecycle_status = 'SUCCEEDED'
+                      )
+                  ''', (os.environ['TARGET_DATE'], os.environ['MORNING_STAGE']))
+                  print('true' if cur.fetchone()[0] else 'false')
+          PY
+          )"
+          echo "already_succeeded=$already" >> "$GITHUB_OUTPUT"
+
+      - name: Compile and execute frozen Morning production
+        id: run
+        shell: bash
+        env:
+          ALREADY_SUCCEEDED: ${{ steps.guard.outputs.already_succeeded }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/boatrace-morning-production.log"
+          if [ "$ALREADY_SUCCEEDED" = true ]; then
+            printf '%s\n' '{"status":"SKIPPED_ALREADY_SUCCEEDED"}' > "$log"
+            code=0
+            disposition=SKIPPED
+          else
+            python -m py_compile \
+              "$RUNTIME_DIR/runner.py" \
+              "$RUNTIME_DIR/production.py" \
+              "$RUNTIME_DIR/run_with_digest.py"
+            set +e
+            (
+              cd "$RUNTIME_DIR"
+              python run_with_digest.py \
+                --target-date "$TARGET_DATE" \
+                --stage "$MORNING_STAGE"
+            ) > "$log" 2>&1
+            code=$?
+            set -e
+            disposition=EXECUTED
+          fi
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "disposition=$disposition" >> "$GITHUB_OUTPUT"
+          echo "log_path=$log" >> "$GITHUB_OUTPUT"
+          tail -n 120 "$log"
+
+      - name: Persist sanitized production evidence
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+          DISPOSITION: ${{ steps.run.outputs.disposition }}
+          LOG_PATH: ${{ steps.run.outputs.log_path }}
+          LEASE_EXPIRES_AT: ${{ steps.lease.outputs.expires_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p ops/boatrace-morning-free
           python - <<'PY'
-          import json, os
+          import json
+          import os
+          import re
           from datetime import datetime, timezone
           from pathlib import Path
-          try:
-              body = json.loads(os.environ.get('response') or '{}')
-          except Exception:
-              body = {'error': 'NON_JSON_RESPONSE'}
+
+          log_path = Path(os.environ['LOG_PATH'])
+          text = log_path.read_text(errors='replace') if log_path.exists() else ''
+          text = re.sub(r'postgres(?:ql)?://[^\s]+', '[REDACTED_DATABASE_URL]', text)
+          code = int(os.environ['EXIT_CODE'])
           result = {
-              'schema_version': 'boatrace-oidc-probe-v1',
-              'started_at_utc': os.environ['started_at'],
+              'schema_version': 'boatrace-public-free-production-run-v1',
               'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
-              'overall': os.environ['overall'],
-              'http_status': int(os.environ['http_status']) if os.environ['http_status'].isdigit() else 0,
-              'error_code': os.environ.get('error_code') or None,
-              'validated_claims': body if body.get('ok') is True else None,
-              'server_error': body if body.get('ok') is not True else None,
-              'jwt_persisted': False,
-              'database_secret_used': False,
+              'target_date': os.environ['TARGET_DATE'],
+              'stage': os.environ['MORNING_STAGE'],
+              'exit_code': code,
+              'success': code == 0,
+              'disposition': os.environ['DISPOSITION'],
+              'event_name': os.environ.get('GITHUB_EVENT_NAME'),
+              'event_schedule': os.environ.get('GITHUB_EVENT_SCHEDULE') or None,
+              'workflow_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'workflow_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'source_commit_sha': os.environ.get('GITHUB_SHA'),
+              'lease_expires_at': os.environ.get('LEASE_EXPIRES_AT'),
+              'database_secret_stored': False,
+              'automatic_purchase': False,
+              'log_tail': text[-6000:],
           }
-          Path('ops/boatrace-morning-free/oidc-probe.json').write_text(
+          Path('ops/boatrace-morning-free/last-run.json').write_text(
               json.dumps(result, ensure_ascii=False, indent=2) + '\n',
               encoding='utf-8',
           )
@@ -97,11 +228,43 @@ jobs:
 
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add ops/boatrace-morning-free/oidc-probe.json
-          git commit -m "Record BOAT RACE OIDC probe ${overall}" || true
-          git pull --rebase origin main
-          git push origin HEAD:main
+          git add ops/boatrace-morning-free/last-run.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Record BOAT RACE Morning ${TARGET_DATE} ${MORNING_STAGE} production"
+            pushed=false
+            for attempt in 1 2 3; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+            done
+            [ "$pushed" = true ]
+          fi
 
-          [ "$overall" = PASS ]
+      - name: Revoke short-lived database lease
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          token_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          jwt="$(jq -er '.value' <<<"$token_response")"
+          echo "::add-mask::$jwt"
+          curl -sS \
+            -o /tmp/db-revoke.json \
+            -X POST \
+            -H "Authorization: Bearer ${jwt}" \
+            -H 'Content-Type: application/json' \
+            "${DATA_API_URL}/rpc/boatrace_oidc_revoke_db_lease" \
+            -d '{}'
+          rm -f /tmp/db-revoke.json
+          exit 0
 
-# probe retry after anonymous-role RPC grant: 2026-08-24 JST
+      - name: Enforce production result
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          [ "$EXIT_CODE" = 0 ]
