@@ -1,0 +1,47 @@
+name: Validate BOAT RACE Morning Production Workflow
+
+on:
+  push:
+    branches:
+      - agent/boatrace-public-free-runtime-20260824
+    paths:
+      - '.github/workflows/boatrace-morning-free-yaml-validate.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/boatrace-public-free-runtime-20260824
+          fetch-depth: 0
+      - name: Parse production workflow YAML
+        run: ruby -e "require 'yaml'; YAML.parse_file('.github/workflows/boatrace-morning-free.yml'); puts 'WORKFLOW_YAML_PASS'"
+      - name: Record workflow validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          Path('ops/boatrace-morning-free/workflow-validation.json').write_text(
+              json.dumps({
+                  'schema_version': 'boatrace-public-workflow-validation-v1',
+                  'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'overall': 'PASS',
+                  'yaml_parse': 'PASS',
+                  'workflow_run_id': os.environ.get('GITHUB_RUN_ID'),
+                  'source_commit_sha': os.environ.get('GITHUB_SHA'),
+              }, indent=2) + '\n', encoding='utf-8'
+          )
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ops/boatrace-morning-free/workflow-validation.json
+          git commit -m 'Record BOAT RACE production workflow validation PASS'
+          git push origin HEAD:agent/boatrace-public-free-runtime-20260824
