@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+pandas==2.2.3
+lxml
+html5lib
+psycopg[binary]
