@@ -1,0 +1,8 @@
+{
+  "schema_version": "boatrace-public-workflow-validation-v1",
+  "recorded_at_utc": "2026-08-24T01:25:48.309281+00:00",
+  "overall": "PASS",
+  "yaml_parse": "PASS",
+  "workflow_run_id": "32679744046",
+  "source_commit_sha": "860cff99db39e5c99fdb435901560237bffce4da"
+}
