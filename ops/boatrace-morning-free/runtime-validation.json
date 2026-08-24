@@ -1,0 +1,10 @@
+{
+  "schema_version": "boatrace-public-runtime-validation-v1",
+  "recorded_at_utc": "2026-08-24T01:24:38.789397+00:00",
+  "overall": "PASS",
+  "python": "3.12",
+  "compile": "PASS",
+  "import_overlay": "PASS",
+  "workflow_run_id": "32679670491",
+  "source_commit_sha": "e2f0d70b8ca8b2ad099f288afc19c261c66496d1"
+}
