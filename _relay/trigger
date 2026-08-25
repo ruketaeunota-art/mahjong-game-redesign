@@ -1,4 +1,4 @@
-requested_at_jst=2026-08-26T07:46:00+09:00
-purpose=deploy-boatrace-line-free-morning-card-v2-secure-relay-v2
+requested_at_jst=2026-08-26T08:17:43+09:00
+purpose=deploy-boatrace-line-free-morning-card-v2-secure-relay-v3
 source_commit=e258e967d7feeec0827179f9f998b55b68f6da55
-manifest_sha256=dfefec5d492415185db63f3c4d2a4c8a16341705c8eeb02ce47a47d9d4a39af0
+source_bundle_sha256=f3d6517bf1ff089f63f47e60083d60cdf5e9849e0e49659cbc7c452f8080aac6
