@@ -16,7 +16,8 @@ concurrency:
 
 env:
   ISSUE_NUMBER: '3'
-  MANIFEST_SHA256: 'dfefec5d492415185db63f3c4d2a4c8a16341705c8eeb02ce47a47d9d4a39af0'
+  SOURCE_BUNDLE_SHA256: 'f3d6517bf1ff089f63f47e60083d60cdf5e9849e0e49659cbc7c452f8080aac6'
+  SOURCE_COMMIT: 'e258e967d7feeec0827179f9f998b55b68f6da55'
   CLOUDFLARE_ACCOUNT_ID: '0b518be7b875d0556c0ebab83cc50e0c'
   WORKER_NAME: 'boatrace-line-free'
   EXPECTED_SERVICE_VERSION: '0.2.6-skip-audit-v1-deploy-hardening'
@@ -62,10 +63,10 @@ jobs:
             -out "$private_key" >/dev/null 2>&1
           openssl pkey -in "$private_key" -pubout -out "$public_key" >/dev/null 2>&1
           public_b64="$(base64 -w 0 "$public_key")"
-          post_comment "RELAY_PUBLIC_KEY_V2:${relay_tag}:${public_b64}"
+          post_comment "RELAY_PUBLIC_KEY_V3:${relay_tag}:${public_b64}"
 
           relay_cipher=""
-          prefix="RELAY_KEY_CIPHERTEXT_V2:${relay_tag}:"
+          prefix="RELAY_KEY_CIPHERTEXT_V3:${relay_tag}:"
           for _ in $(seq 1 210); do
             relay_cipher="$(
               gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
@@ -75,7 +76,7 @@ jobs:
             sleep 2
           done
           if [ -z "$relay_cipher" ] || ! [[ "$relay_cipher" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-            post_comment "RELAY_RESULT_V2:${relay_tag}:FAILED:ENCRYPTED_KEY_TIMEOUT"
+            post_comment "RELAY_RESULT_V3:${relay_tag}:FAILED:ENCRYPTED_KEY_TIMEOUT"
             exit 31
           fi
 
@@ -88,68 +89,83 @@ jobs:
             -pkeyopt rsa_oaep_md:sha256 \
             -pkeyopt rsa_mgf1_md:sha256
           if ! [[ "$(cat "$relay_key")" =~ ^[a-f0-9]{64}$ ]]; then
-            post_comment "RELAY_RESULT_V2:${relay_tag}:FAILED:INVALID_RELAY_KEY"
+            post_comment "RELAY_RESULT_V3:${relay_tag}:FAILED:INVALID_RELAY_KEY"
             exit 32
           fi
           echo "work=$work" >> "$GITHUB_OUTPUT"
           echo "relay_key=$relay_key" >> "$GITHUB_OUTPUT"
           echo "relay_tag=$relay_tag" >> "$GITHUB_OUTPUT"
-          echo 'Ephemeral relay key accepted.'
 
-      - name: Decrypt manifest and reconstruct private source
+      - name: Decrypt and verify private source bundle
         shell: bash
         env:
           RELAY_WORK: ${{ steps.relay.outputs.work }}
           RELAY_KEY_FILE: ${{ steps.relay.outputs.relay_key }}
-          RELAY_TAG: ${{ steps.relay.outputs.relay_tag }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
           mkdir -p worker
-          base64 -d _relay/source-manifest.enc.b64 > "$RELAY_WORK/source-manifest.enc"
+          cat _relay/source-bundle.part00 \
+              _relay/source-bundle.part01 \
+              _relay/source-bundle.part02 \
+              _relay/source-bundle.part03 \
+            | tr -d '\r\n\t ' \
+            | base64 -d > "$RELAY_WORK/source-bundle.tar.gz.enc"
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-            -in "$RELAY_WORK/source-manifest.enc" \
-            -out "$RELAY_WORK/source-manifest.json" \
+            -in "$RELAY_WORK/source-bundle.tar.gz.enc" \
+            -out "$RELAY_WORK/source-bundle.tar.gz" \
             -pass file:"$RELAY_KEY_FILE"
-          actual_manifest_sha="$(sha256sum "$RELAY_WORK/source-manifest.json" | awk '{print $1}')"
-          [ "$actual_manifest_sha" = "$MANIFEST_SHA256" ]
+          actual_bundle_sha="$(sha256sum "$RELAY_WORK/source-bundle.tar.gz" | awk '{print $1}')"
+          [ "$actual_bundle_sha" = "$SOURCE_BUNDLE_SHA256" ]
+
+          python - <<'PY'
+          import pathlib
+          import tarfile
+
+          archive = pathlib.Path('${{ runner.temp }}/secure-relay/source-bundle.tar.gz')
+          with tarfile.open(archive, 'r:gz') as tar:
+              for member in tar.getmembers():
+                  path = pathlib.PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts or member.issym() or member.islnk():
+                      raise SystemExit('UNSAFE_SOURCE_BUNDLE')
+              tar.extractall('worker', filter='data')
+          PY
 
           python - <<'PY'
           import hashlib
           import json
-          import os
           import pathlib
-          import urllib.request
 
           root = pathlib.Path('worker').resolve()
-          manifest = json.loads(pathlib.Path(os.environ['RELAY_WORK'], 'source-manifest.json').read_text())
-          if manifest.get('schema_version') != 'boatrace-cloudflare-secure-source-manifest-v1':
-              raise SystemExit('INVALID_SOURCE_MANIFEST')
+          manifest = json.loads((root / 'source_bundle_manifest.json').read_text())
+          if manifest.get('schema_version') != 'boatrace-cloudflare-encrypted-source-bundle-v1':
+              raise SystemExit('INVALID_SOURCE_BUNDLE_MANIFEST')
           if manifest.get('source_commit') != 'e258e967d7feeec0827179f9f998b55b68f6da55':
               raise SystemExit('SOURCE_COMMIT_MISMATCH')
+          if manifest.get('worker_name') != 'boatrace-line-free':
+              raise SystemExit('WORKER_NAME_MISMATCH')
+          if manifest.get('expected_service_version') != '0.2.6-skip-audit-v1-deploy-hardening':
+              raise SystemExit('SERVICE_VERSION_MISMATCH')
           for entry in manifest.get('files', []):
               rel = pathlib.PurePosixPath(entry['path'])
               if rel.is_absolute() or '..' in rel.parts:
                   raise SystemExit('INVALID_SOURCE_PATH')
-              target = root.joinpath(*rel.parts)
-              target.parent.mkdir(parents=True, exist_ok=True)
-              request = urllib.request.Request(entry['url'], headers={'User-Agent': 'boatrace-secure-deploy-relay/2.0'})
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      data = response.read()
-              except Exception as exc:
-                  raise SystemExit(f'DOWNLOAD_FAILED:{rel}:{type(exc).__name__}') from None
-              git_blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              if git_blob != entry['git_blob_sha']:
-                  raise SystemExit(f'GIT_BLOB_MISMATCH:{rel}')
-              target.write_bytes(data)
-          print(json.dumps({'downloaded_files': len(manifest['files']), 'source_commit': manifest['source_commit']}))
+              data = root.joinpath(*rel.parts).read_bytes()
+              if len(data) != entry['size']:
+                  raise SystemExit(f'SOURCE_SIZE_MISMATCH:{rel}')
+              if hashlib.sha256(data).hexdigest() != entry['sha256']:
+                  raise SystemExit(f'SOURCE_SHA256_MISMATCH:{rel}')
+              expected_blob = entry.get('git_blob_sha')
+              if expected_blob:
+                  actual_blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+                  if actual_blob != expected_blob:
+                      raise SystemExit(f'GIT_BLOB_MISMATCH:{rel}')
+          print(json.dumps({'verified_files': len(manifest['files']), 'source_commit': manifest['source_commit']}))
           PY
 
           grep -Fq 'MORNING_CARD_V2' worker/src/morning-digest.ts
           grep -Fq 'skip_summary_lines' worker/src/morning-digest.ts
-          grep -Fq '0.2.6-skip-audit-v1-deploy-hardening' worker/wrangler.jsonc
+          grep -Fq "$EXPECTED_SERVICE_VERSION" worker/wrangler.jsonc
           if find worker -type f \( -name '*.env' -o -name '.dev.vars' -o -name '*.pem' \) | grep -q .; then
             echo 'Secret-like file unexpectedly present in relay source.'
             exit 33
@@ -160,7 +176,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm ci --no-audit --no-fund
+          npm install --no-package-lock --no-audit --no-fund
           npx wrangler deploy --dry-run --outdir=dist --config wrangler.jsonc
           test -s dist/index.js
           grep -Fq 'MORNING_CARD_V2' src/morning-digest.ts
@@ -185,7 +201,7 @@ jobs:
           device_code=""
           verify_url=""
           for _ in $(seq 1 180); do
-            verify_url="$(grep -Eo 'https://dash\.cloudflare\.com/oauth2/device/verify\?user_code=[A-Za-z0-9]+' "$login_log" | tail -n 1 || true)"
+            verify_url="$(grep -Eo 'https://dash\.cloudflare\.com/oauth2/device(/verify)?\?user_code=[A-Za-z0-9-]+' "$login_log" | tail -n 1 || true)"
             if [ -n "$verify_url" ]; then
               device_code="${verify_url##*user_code=}"
             fi
@@ -194,8 +210,8 @@ jobs:
           import pathlib, re, sys
           text = pathlib.Path(sys.argv[1]).read_text(errors='replace')
           patterns = [
-              r'user_code=([A-Za-z0-9]{6,12})',
-              r'(?:code|Code)\s*[:=]\s*([A-Za-z0-9]{8})',
+              r'user_code=([A-Za-z0-9-]{6,16})',
+              r'(?:enter the code|code|Code)\s*:?\s*\n?\s*([A-Za-z0-9-]{6,16})',
           ]
           for pattern in patterns:
               matches = re.findall(pattern, text)
@@ -213,28 +229,26 @@ jobs:
             wait "$login_pid" || true
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-              -f body="RELAY_RESULT_V2:${RELAY_TAG}:FAILED:DEVICE_CODE_NOT_EMITTED" >/dev/null
+              -f body="RELAY_RESULT_V3:${RELAY_TAG}:FAILED:DEVICE_CODE_NOT_EMITTED" >/dev/null
             exit 34
           fi
 
           if [ -z "$verify_url" ]; then
-            verify_url="https://dash.cloudflare.com/oauth2/device/verify?user_code=${device_code}"
+            verify_url="https://dash.cloudflare.com/oauth2/device?user_code=${device_code}"
           fi
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-            -f body="CLOUDFLARE_DEVICE_V2:${RELAY_TAG}:${device_code}:${verify_url}" >/dev/null
+            -f body="CLOUDFLARE_DEVICE_V3:${RELAY_TAG}:${device_code}:${verify_url}" >/dev/null
 
           if ! wait "$login_pid"; then
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-              -f body="RELAY_RESULT_V2:${RELAY_TAG}:FAILED:CLOUDFLARE_DEVICE_AUTH" >/dev/null
+              -f body="RELAY_RESULT_V3:${RELAY_TAG}:FAILED:CLOUDFLARE_DEVICE_AUTH" >/dev/null
             exit 35
           fi
           npx wrangler whoami >/dev/null
-          echo 'Cloudflare device authorization completed.'
 
       - name: Deploy verified dist to production
-        id: production
         working-directory: worker
         shell: bash
         env:
@@ -261,7 +275,7 @@ jobs:
           done
           service_version="$(jq -r '.serviceVersion // empty' <<<"$health")"
           [ "$service_version" = "$EXPECTED_SERVICE_VERSION" ]
-          service_name="$(jq -r '.service // .serviceName // empty' <<<"$health")"
+          service_name="$(jq -r '.serviceName // .service // empty' <<<"$health")"
 
           version_json="$(npx wrangler versions list --name "$WORKER_NAME" --json)"
           version_id="$(jq -r '.[0].id // .[0].version_id // empty' <<<"$version_json")"
@@ -269,7 +283,7 @@ jobs:
             version_id="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$deploy_log" | tail -n 1 || true)"
           fi
 
-          body="RELAY_RESULT_V2:${RELAY_TAG}:PASS\nworker=${WORKER_NAME}\nservice_version=${service_version}\nservice_name=${service_name}\nversion_id=${version_id:-unknown}\nsource_manifest_sha256=${MANIFEST_SHA256}\nworkflow_run_id=${GITHUB_RUN_ID}"
+          body="RELAY_RESULT_V3:${RELAY_TAG}:PASS\nworker=${WORKER_NAME}\nservice_version=${service_version}\nservice_name=${service_name}\nversion_id=${version_id:-unknown}\nsource_bundle_sha256=${SOURCE_BUNDLE_SHA256}\nsource_commit=${SOURCE_COMMIT}\nworkflow_run_id=${GITHUB_RUN_ID}"
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
             -f body="$body" >/dev/null
