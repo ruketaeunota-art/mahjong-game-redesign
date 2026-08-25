@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/boatrace-morning-free.yml'
+      - 'ops/boatrace-morning-free/runtime/**'
   workflow_dispatch:
     inputs:
       target_date:
@@ -19,6 +20,11 @@ on:
         required: false
         type: choice
         options: [EARLY, LATE]
+      force_replay:
+        description: Allow a replay after an existing successful stage
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -32,16 +38,18 @@ env:
   DATA_API_URL: https://ep-weathered-cloud-ax67iew3.apirest.c-4.us-east-2.aws.neon.tech/neondb/rest/v1
   OIDC_AUDIENCE: neon-boatrace-morning-free
   RUNTIME_DIR: ops/boatrace-morning-free/runtime
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PYTHONUNBUFFERED: '1'
 
 jobs:
   production:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: Checkout production runtime
+      - name: Checkout exact production runtime
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -56,11 +64,13 @@ jobs:
         env:
           INPUT_DATE: ${{ inputs.target_date }}
           INPUT_STAGE: ${{ inputs.stage }}
+          INPUT_FORCE_REPLAY: ${{ inputs.force_replay }}
           EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
           target="${INPUT_DATE:-}"
           stage="${INPUT_STAGE:-}"
+          force_replay="${INPUT_FORCE_REPLAY:-false}"
           if [ -z "$target" ]; then target="$(TZ=Asia/Tokyo date +%F)"; fi
           if [ -z "$stage" ]; then
             case "${EVENT_SCHEDULE:-}" in
@@ -70,8 +80,10 @@ jobs:
           fi
           [[ "$target" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
           [[ "$stage" = EARLY || "$stage" = LATE ]]
+          [[ "$force_replay" = true || "$force_replay" = false ]]
           echo "TARGET_DATE=$target" >> "$GITHUB_ENV"
           echo "MORNING_STAGE=$stage" >> "$GITHUB_ENV"
+          echo "FORCE_REPLAY=$force_replay" >> "$GITHUB_ENV"
           echo "EVENT_SCHEDULE=${EVENT_SCHEDULE:-}" >> "$GITHUB_ENV"
 
       - name: Acquire short-lived Neon database lease with GitHub OIDC
@@ -107,253 +119,244 @@ jobs:
           rm -f /tmp/db-lease.json
 
       - name: Install exact production dependencies
-        run: python -m pip install --disable-pip-version-check -r "$RUNTIME_DIR/requirements.txt"
+        run: python -m pip install --requirement "$RUNTIME_DIR/requirements.txt"
 
-      - name: Check logical-stage idempotency
-        id: guard
-        shell: bash
-        run: |
-          set -euo pipefail
-          already="$(python - <<'PY'
-          import os
-          import psycopg
-          with psycopg.connect(os.environ['DATABASE_URL']) as conn:
-              with conn.cursor() as cur:
-                  cur.execute('''
-                      SELECT EXISTS (
-                          SELECT 1
-                            FROM ux_app.run_executions r
-                            JOIN LATERAL (
-                                SELECT lifecycle_status
-                                  FROM ux_app.run_events
-                                 WHERE run_execution_id = r.id
-                                 ORDER BY event_seq DESC
-                                 LIMIT 1
-                            ) e ON true
-                           WHERE r.target_date = %s::date
-                             AND r.stage = %s::text
-                             AND e.lifecycle_status = 'SUCCEEDED'
-                      )
-                  ''', (os.environ['TARGET_DATE'], os.environ['MORNING_STAGE']))
-                  print('true' if cur.fetchone()[0] else 'false')
-          PY
-          )"
-          echo "already_succeeded=$already" >> "$GITHUB_OUTPUT"
-
-      - name: Verify LINE skip-detail DB fallback state
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p evidence
-          python - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
-          import psycopg
-          from psycopg.rows import dict_row
-
-          result = {
-              'schema_version': 'boatrace-line-db-fallback-verification-v2',
-              'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
-              'read_only_verification': True,
-              'notification_requeued': False,
-              'latest_skip_audit_event': None,
-              'trigger': None,
-              'function_present': None,
-              'latest_morning_digest': None,
-              'query_errors': [],
-              'status': 'UNKNOWN',
-          }
-
-          def one(label, sql):
-              try:
-                  with psycopg.connect(os.environ['DATABASE_URL'], row_factory=dict_row) as conn:
-                      conn.execute('SET TRANSACTION READ ONLY')
-                      with conn.cursor() as cur:
-                          cur.execute(sql)
-                          row = cur.fetchone()
-                          return None if row is None else dict(row)
-              except Exception as exc:
-                  result['query_errors'].append({'query': label, 'error_type': type(exc).__name__})
-                  return None
-
-          result['latest_skip_audit_event'] = one('latest_skip_audit_event', '''
-              SELECT
-                r.id AS run_execution_id,
-                r.target_date::text AS target_date,
-                r.stage,
-                e.event_seq,
-                e.lifecycle_status,
-                e.outcome,
-                e.actionable_count,
-                e.s_count,
-                e.a_count,
-                e.details->>'skip_audit_version' AS skip_audit_version,
-                CASE WHEN COALESCE(e.details->>'skip_audit_count','') ~ '^\\d+$'
-                     THEN (e.details->>'skip_audit_count')::integer ELSE NULL END AS skip_audit_count
-              FROM ux_app.run_executions r
-              JOIN LATERAL (
-                SELECT x.* FROM ux_app.run_events x
-                WHERE x.run_execution_id=r.id
-                ORDER BY x.event_seq DESC LIMIT 1
-              ) e ON true
-              WHERE e.details->>'skip_audit_version'='morning-skip-audit-v1'
-              ORDER BY r.id DESC LIMIT 1
-          ''')
-
-          result['function_present'] = one('function_present', '''
-              SELECT EXISTS (
-                SELECT 1 FROM pg_proc p
-                JOIN pg_namespace n ON n.oid=p.pronamespace
-                WHERE n.nspname='ux_app'
-                  AND p.proname='enrich_morning_digest_skip_audit_v1'
-              ) AS present
-          ''')
-
-          result['trigger'] = one('trigger', '''
-              SELECT t.tgenabled
-              FROM pg_trigger t
-              JOIN pg_class c ON c.oid=t.tgrelid
-              JOIN pg_namespace n ON n.oid=c.relnamespace
-              WHERE n.nspname='ux_app'
-                AND c.relname='notification_outbox'
-                AND t.tgname='morning_digest_skip_audit_enrichment'
-                AND NOT t.tgisinternal
-              LIMIT 1
-          ''')
-
-          result['latest_morning_digest'] = one('latest_morning_digest', '''
-              SELECT
-                o.id,
-                o.run_execution_id,
-                o.status,
-                o.created_at::text AS created_at,
-                o.accepted_at::text AS accepted_at,
-                (o.provider_message_id IS NOT NULL) AS provider_message_id_present,
-                o.payload->>'presentation' AS presentation,
-                o.payload->>'ui_version' AS ui_version,
-                o.payload->>'skip_audit_version' AS skip_audit_version,
-                CASE WHEN jsonb_typeof(o.payload->'skip_summary_lines')='array'
-                     THEN jsonb_array_length(o.payload->'skip_summary_lines') ELSE 0 END AS skip_summary_line_count,
-                POSITION('見送り内訳' IN COALESCE(o.payload->>'canonical_text','')) > 0 AS canonical_has_skip_breakdown,
-                POSITION('実オッズEVはこの通知では未評価' IN COALESCE(o.payload->>'canonical_text','')) > 0 AS canonical_has_ev_disclaimer
-              FROM ux_app.notification_outbox o
-              WHERE o.event_kind='MORNING_DIGEST'
-              ORDER BY o.id DESC LIMIT 1
-          ''')
-
-          event = result['latest_skip_audit_event'] or {}
-          trigger = result['trigger'] or {}
-          function_present = result['function_present'] or {}
-          digest = result['latest_morning_digest'] or {}
-          generated = (
-              event.get('skip_audit_version') == 'morning-skip-audit-v1'
-              and isinstance(event.get('skip_audit_count'), int)
-              and event.get('skip_audit_count', 0) > 0
-          )
-          enrichment_ready = bool(function_present.get('present') and trigger.get('tgenabled') in ('O', 'A'))
-          delivered = bool(
-              digest.get('presentation') == 'MORNING_CARD_V2'
-              and digest.get('canonical_has_skip_breakdown')
-              and digest.get('canonical_has_ev_disclaimer')
-              and digest.get('status') in ('SENT', 'DELIVERED', 'ACCEPTED')
-          )
-          if delivered:
-              result['status'] = 'PASS_DELIVERED'
-          elif generated and enrichment_ready:
-              result['status'] = 'READY_NEXT_DIGEST'
-          elif generated:
-              result['status'] = 'RUN_EVENT_READY_OUTBOX_UNVERIFIED'
-          else:
-              result['status'] = 'BLOCKED'
-
-          Path('evidence/boatrace-line-db-fallback-verification.json').write_text(
-              json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
-          )
-          print(json.dumps(result, ensure_ascii=False, indent=2))
-          PY
-
-      - name: Compile and execute frozen Morning production
+      - name: Execute one locked Morning run and verify LINE acceptance
         id: run
         shell: bash
-        env:
-          ALREADY_SUCCEEDED: ${{ steps.guard.outputs.already_succeeded }}
         run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/boatrace-morning-production.log"
-          if [ "$ALREADY_SUCCEEDED" = true ]; then
-            printf '%s\n' '{"status":"SKIPPED_ALREADY_SUCCEEDED"}' > "$log"
-            code=0
-            disposition=SKIPPED
+          set -uo pipefail
+
+          LOG="$RUNNER_TEMP/boatrace-morning-production.log"
+          LOCK_READY="$RUNNER_TEMP/morning-stage-lock-ready.json"
+          LOCK_RELEASE="$RUNNER_TEMP/morning-stage-lock-release"
+          DELIVERY_EVIDENCE="$GITHUB_WORKSPACE/ops/boatrace-morning-free/delivery-latest.json"
+          mkdir -p "$GITHUB_WORKSPACE/ops/boatrace-morning-free"
+          rm -f "$LOCK_READY" "$LOCK_RELEASE" "$DELIVERY_EVIDENCE"
+
+          CODE=0
+          SKIPPED=false
+          DISPOSITION=EXECUTED
+          RUN_ID=""
+          EXPECTED_SKIP_COUNT=""
+          LOCK_PID=""
+
+          cleanup_lock() {
+            touch "$LOCK_RELEASE" 2>/dev/null || true
+            if [ -n "${LOCK_PID:-}" ]; then
+              wait "$LOCK_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_lock EXIT
+
+          python "$RUNTIME_DIR/stage_lock.py" \
+            --target-date "$TARGET_DATE" \
+            --stage "$MORNING_STAGE" \
+            --ready-file "$LOCK_READY" \
+            --release-file "$LOCK_RELEASE" \
+            --timeout-seconds 2100 \
+            > "$RUNNER_TEMP/morning-stage-lock.log" 2>&1 &
+          LOCK_PID=$!
+
+          for _ in $(seq 1 120); do
+            [ -s "$LOCK_READY" ] && break
+            sleep 0.25
+          done
+
+          if [ ! -s "$LOCK_READY" ]; then
+            CODE=21
+            DISPOSITION=LOCK_START_TIMEOUT
           else
-            python -m py_compile \
-              "$RUNTIME_DIR/runner.py" \
-              "$RUNTIME_DIR/production.py" \
-              "$RUNTIME_DIR/run_with_digest.py"
+            LOCK_STATUS="$(jq -r '.status' "$LOCK_READY")"
+            case "$LOCK_STATUS" in
+              LOCK_BUSY)
+                SKIPPED=true
+                DISPOSITION=SKIPPED_STAGE_LOCKED
+                ;;
+              LOCK_ACQUIRED)
+                ;;
+              *)
+                CODE=22
+                DISPOSITION=LOCK_ERROR
+                ;;
+            esac
+          fi
+
+          if [ "$CODE" -eq 0 ] && [ "$SKIPPED" = false ]; then
             set +e
             (
               cd "$RUNTIME_DIR"
-              python run_with_digest.py --target-date "$TARGET_DATE" --stage "$MORNING_STAGE"
-            ) > "$log" 2>&1
-            code=$?
+              python -m py_compile \
+                runner.py \
+                production.py \
+                audit_overlay.py \
+                run_with_digest.py \
+                stage_guard.py \
+                stage_lock.py \
+                delivery_gate.py \
+                verify_runtime_manifest.py && \
+              python verify_runtime_manifest.py --manifest runtime_manifest.json
+            ) > "$LOG" 2>&1
+            CODE=$?
             set -e
-            disposition=EXECUTED
+            if [ "$CODE" -ne 0 ]; then DISPOSITION=RUNTIME_VALIDATION_FAILED; fi
           fi
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          echo "disposition=$disposition" >> "$GITHUB_OUTPUT"
-          echo "log_path=$log" >> "$GITHUB_OUTPUT"
-          tail -n 120 "$log"
 
-      - name: Persist sanitized production evidence
-        shell: bash
-        env:
-          EXIT_CODE: ${{ steps.run.outputs.exit_code }}
-          DISPOSITION: ${{ steps.run.outputs.disposition }}
-          LOG_PATH: ${{ steps.run.outputs.log_path }}
-          LEASE_EXPIRES_AT: ${{ steps.lease.outputs.expires_at }}
-        run: |
-          set -euo pipefail
+          if [ "$CODE" -eq 0 ] && [ "$SKIPPED" = false ] && [ "$FORCE_REPLAY" != true ]; then
+            set +e
+            python "$RUNTIME_DIR/stage_guard.py" \
+              --target-date "$TARGET_DATE" \
+              --stage "$MORNING_STAGE" >> "$LOG" 2>&1
+            GUARD_CODE=$?
+            set -e
+            if [ "$GUARD_CODE" -eq 10 ]; then
+              SKIPPED=true
+              DISPOSITION=SKIPPED_ALREADY_STARTED
+            elif [ "$GUARD_CODE" -ne 0 ]; then
+              CODE=$GUARD_CODE
+              DISPOSITION=STAGE_GUARD_FAILED
+            fi
+          fi
+
+          if [ "$CODE" -eq 0 ] && [ "$SKIPPED" = false ]; then
+            set +e
+            (
+              cd "$RUNTIME_DIR"
+              python run_with_digest.py \
+                --target-date "$TARGET_DATE" \
+                --stage "$MORNING_STAGE"
+            ) >> "$LOG" 2>&1
+            CODE=$?
+            set -e
+            if [ "$CODE" -ne 0 ]; then DISPOSITION=MORNING_RUN_FAILED; fi
+          fi
+
+          if [ "$CODE" -eq 0 ] && [ "$SKIPPED" = false ]; then
+            set +e
+            python - "$LOG" > "$RUNNER_TEMP/morning-run-result.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          for line in reversed(Path(sys.argv[1]).read_text(errors='replace').splitlines()):
+              try:
+                  value = json.loads(line)
+              except Exception:
+                  continue
+              if isinstance(value, dict) and isinstance(value.get('run_id'), int) and isinstance(value.get('result'), dict):
+                  result = value['result']
+                  actionable = int(result.get('actionable', 0))
+                  s_count = int(result.get('s', 0))
+                  a_count = int(result.get('a', 0))
+                  skip_count = actionable - s_count - a_count
+                  if skip_count < 0:
+                      raise SystemExit(2)
+                  print(json.dumps({'run_id': value['run_id'], 'expected_skip_count': skip_count}))
+                  raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            PARSE_CODE=$?
+            set -e
+            if [ "$PARSE_CODE" -ne 0 ]; then
+              CODE=23
+              DISPOSITION=RUN_RESULT_PARSE_FAILED
+            else
+              RUN_ID="$(jq -r '.run_id' "$RUNNER_TEMP/morning-run-result.json")"
+              EXPECTED_SKIP_COUNT="$(jq -r '.expected_skip_count' "$RUNNER_TEMP/morning-run-result.json")"
+            fi
+          fi
+
+          if [ "$CODE" -eq 0 ] && [ "$SKIPPED" = false ]; then
+            set +e
+            python "$RUNTIME_DIR/delivery_gate.py" \
+              --run-id "$RUN_ID" \
+              --expected-skip-count "$EXPECTED_SKIP_COUNT" \
+              --evidence-file "$DELIVERY_EVIDENCE" \
+              --timeout-seconds 150 \
+              --poll-seconds 2 >> "$LOG" 2>&1
+            DELIVERY_CODE=$?
+            set -e
+            if [ "$DELIVERY_CODE" -ne 0 ]; then
+              CODE=$DELIVERY_CODE
+              DISPOSITION=DELIVERY_GATE_FAILED
+            else
+              DISPOSITION=PASS_DELIVERED
+            fi
+          fi
+
+          cleanup_lock
+          trap - EXIT
+
+          export CODE SKIPPED DISPOSITION LOG RUN_ID EXPECTED_SKIP_COUNT LOCK_READY DELIVERY_EVIDENCE
           python - <<'PY'
-          import json, os, re
+          import json
+          import os
+          import re
           from datetime import datetime, timezone
           from pathlib import Path
-          log = Path(os.environ['LOG_PATH']).read_text(errors='replace')
-          log = re.sub(r'postgres(?:ql)?://[^\s]+', '[REDACTED_DATABASE_URL]', log)
-          code = int(os.environ['EXIT_CODE'])
-          result = {
-              'schema_version': 'boatrace-public-free-production-run-v2',
+
+          log_path = Path(os.environ['LOG'])
+          text = log_path.read_text(errors='replace') if log_path.exists() else ''
+          text = re.sub(r'postgres(?:ql)?://[^\s]+', '[REDACTED_DATABASE_URL]', text)
+          lock_path = Path(os.environ['LOCK_READY'])
+          delivery_path = Path(os.environ['DELIVERY_EVIDENCE'])
+          payload = {
+              'schema_version': 'boatrace-public-free-production-run-v3',
               'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
               'target_date': os.environ['TARGET_DATE'],
               'stage': os.environ['MORNING_STAGE'],
-              'exit_code': code,
-              'success': code == 0,
+              'exit_code': int(os.environ['CODE']),
+              'success': int(os.environ['CODE']) == 0,
+              'skipped': os.environ['SKIPPED'] == 'true',
               'disposition': os.environ['DISPOSITION'],
+              'force_replay': os.environ.get('FORCE_REPLAY') == 'true',
+              'run_execution_id': int(os.environ['RUN_ID']) if os.environ.get('RUN_ID') else None,
+              'expected_skip_count': int(os.environ['EXPECTED_SKIP_COUNT']) if os.environ.get('EXPECTED_SKIP_COUNT') else None,
+              'stage_lock': json.loads(lock_path.read_text()) if lock_path.is_file() else None,
+              'delivery_gate': json.loads(delivery_path.read_text()) if delivery_path.is_file() else None,
+              'runtime_contract_version': 'morning-prod-hardening-20260825-001',
               'event_name': os.environ.get('GITHUB_EVENT_NAME'),
               'event_schedule': os.environ.get('EVENT_SCHEDULE') or None,
+              'source_commit_sha': os.environ.get('GITHUB_SHA'),
               'workflow_run_id': os.environ.get('GITHUB_RUN_ID'),
               'workflow_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
-              'source_commit_sha': os.environ.get('GITHUB_SHA'),
               'lease_expires_at': os.environ.get('LEASE_EXPIRES_AT'),
               'database_secret_stored': False,
               'automatic_purchase': False,
-              'log_tail': log[-6000:],
+              'log_tail': text[-6000:],
           }
           Path('ops/boatrace-morning-free/last-run.json').write_text(
-              json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+              json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
           )
           PY
+
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "disposition=$DISPOSITION" >> "$GITHUB_OUTPUT"
+          tail -n 160 "$LOG" || true
+          exit 0
+        env:
+          LEASE_EXPIRES_AT: ${{ steps.lease.outputs.expires_at }}
+
+      - name: Persist sanitized production evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add ops/boatrace-morning-free/last-run.json evidence/boatrace-line-db-fallback-verification.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Record BOAT RACE Morning ${TARGET_DATE} ${MORNING_STAGE} production"
-            pushed=false
-            for attempt in 1 2 3; do
-              if git pull --rebase origin main && git push origin HEAD:main; then pushed=true; break; fi
-            done
-            [ "$pushed" = true ]
+          if [ -f ops/boatrace-morning-free/last-run.json ]; then
+            git add ops/boatrace-morning-free/last-run.json
           fi
+          if [ -f ops/boatrace-morning-free/delivery-latest.json ]; then
+            git add ops/boatrace-morning-free/delivery-latest.json
+          fi
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Record BOAT RACE Morning ${TARGET_DATE} ${MORNING_STAGE} production"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then exit 0; fi
+          done
+          exit 70
 
       - name: Revoke short-lived database lease
         if: always()
@@ -377,11 +380,10 @@ jobs:
           exit 0
 
       - name: Enforce production result
+        if: always()
         shell: bash
         env:
           EXIT_CODE: ${{ steps.run.outputs.exit_code }}
         run: |
           set -euo pipefail
-          [ "$EXIT_CODE" = 0 ]
-
-# retry after Neon caller allowlist fix: 2026-08-24
+          [ "${EXIT_CODE:-99}" = 0 ]
