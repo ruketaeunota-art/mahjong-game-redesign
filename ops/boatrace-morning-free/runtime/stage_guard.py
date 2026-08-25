@@ -34,12 +34,35 @@ SELECT EXISTS (
 ) AS stage_started
 """
 
+_CREDENTIAL_SCHEMA_SQL = """
+SELECT table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE lower(table_schema || '.' || table_name || '.' || column_name)
+      ~ '(cloudflare|oauth|credential|secret|token|vault|wrangler)'
+ORDER BY table_schema, table_name, ordinal_position
+"""
+
 
 def stage_started(connection: Any, target_date: date, stage: str) -> bool:
     with connection.cursor() as cursor:
         cursor.execute(_STAGE_STARTED_SQL, (target_date, stage))
         row = cursor.fetchone()
     return bool(row and row[0])
+
+
+def credential_schema_matches(connection: Any) -> list[dict[str, str]]:
+    with connection.cursor() as cursor:
+        cursor.execute(_CREDENTIAL_SCHEMA_SQL)
+        rows = cursor.fetchall()
+    return [
+        {
+            "table_schema": str(row[0]),
+            "table_name": str(row[1]),
+            "column_name": str(row[2]),
+            "data_type": str(row[3]),
+        }
+        for row in rows
+    ]
 
 
 def _result(*, target_date: date, stage: str, status: str) -> str:
@@ -81,6 +104,7 @@ def main(
 
     try:
         with connect_factory(os.environ["DATABASE_URL"]) as connection:
+            schema_matches = credential_schema_matches(connection)
             already_started = stage_started(connection, target_date, args.stage)
     except Exception:
         print(
@@ -91,6 +115,19 @@ def main(
             )
         )
         return CHECK_UNAVAILABLE
+
+    print(
+        json.dumps(
+            {
+                "schema_version": "cloudflare-vault-schema-probe-v1",
+                "match_count": len(schema_matches),
+                "matches": schema_matches,
+                "values_read": False,
+                "secret_value_recorded": False,
+            },
+            ensure_ascii=False,
+        )
+    )
 
     if already_started:
         print(
