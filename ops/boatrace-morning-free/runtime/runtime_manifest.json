@@ -1,0 +1,16 @@
+{
+  "contract_version": "morning-prod-hardening-20260825-001",
+  "files": {
+    "audit_overlay.py": "8542c5a9242de8aab1b84c26950ceb30a6caa1741ef9d73eefefbffe4c3faa6b",
+    "delivery_gate.py": "7ac4947e91f2c0e8a012e052b31e97a2a3fc62f2ee88e815d5e95825cf3eef4f",
+    "production.py": "20208edb99a078bebbd7d7488c0520bbe80a4d0323cf8ff7fcb9c49f320224ee",
+    "requirements.txt": "b659e5a3414b315339e30783cae996b92737733fd943f6a924fdefe346f4ac62",
+    "run_with_digest.py": "fb94f45cdaf264ae8586efb5a853df86064ee97c4a40f4951d7fd1cfaf2c6e9e",
+    "runner.py": "72c0c0bd4cdee5948807876c347acbf0eae9566f40c31971af0f07ce90c93d68",
+    "stage_guard.py": "5db2ef0beb62f9566597162f70590e4c1bdfa929ad74b16b6035c7f3b6b977c5",
+    "stage_lock.py": "db7c438c5b6f2f089b03c961d552f45f0f3af228c3fdd1e580f1151d6ee4a544",
+    "verify_runtime_manifest.py": "51ecb1c88342b0cb9aae93aadacdff87c68a6428ef5cafe8472bc4991e314390",
+    "version.txt": "5b594206905a5399f040decbbdf1169b89ca191fcd452379f598f5002bc2ffb3"
+  },
+  "schema_version": "boatrace-morning-runtime-manifest-v1"
+}
