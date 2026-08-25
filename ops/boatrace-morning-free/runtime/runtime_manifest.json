@@ -1,0 +1,11 @@
+{
+  "contract_version": "morning-prod-hardening-20260825-001",
+  "files": {
+    "audit_overlay.py": "8542c5a9242de8aab1b84c26950ceb30a6caa1741ef9d73eefefbffe4c3faa6b",
+    "delivery_gate.py": "f5340540a8ccc380473ec90fe8b3e2a17dbb0fce92a048f4766a135588bc47c7",
+    "run_with_digest.py": "fb94f45cdaf264ae8586efb5a853df86064ee97c4a40f4951d7fd1cfaf2c6e9e",
+    "stage_guard.py": "5db2ef0beb62f9566597162f70590e4c1bdfa929ad74b16b6035c7f3b6b977c5",
+    "stage_lock.py": "db7c438c5b6f2f089b03c961d552f45f0f3af228c3fdd1e580f1151d6ee4a544"
+  },
+  "schema_version": "boatrace-morning-runtime-manifest-v1"
+}
