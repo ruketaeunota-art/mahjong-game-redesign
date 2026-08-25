@@ -7,7 +7,7 @@
     "requirements.txt": "b659e5a3414b315339e30783cae996b92737733fd943f6a924fdefe346f4ac62",
     "run_with_digest.py": "fb94f45cdaf264ae8586efb5a853df86064ee97c4a40f4951d7fd1cfaf2c6e9e",
     "runner.py": "72c0c0bd4cdee5948807876c347acbf0eae9566f40c31971af0f07ce90c93d68",
-    "stage_guard.py": "5db2ef0beb62f9566597162f70590e4c1bdfa929ad74b16b6035c7f3b6b977c5",
+    "stage_guard.py": "2ca8bd8e1c9ee4d7d7784f20905be955bc7b9780525e8211892c4bef00cfe26f",
     "stage_lock.py": "db7c438c5b6f2f089b03c961d552f45f0f3af228c3fdd1e580f1151d6ee4a544",
     "verify_runtime_manifest.py": "51ecb1c88342b0cb9aae93aadacdff87c68a6428ef5cafe8472bc4991e314390",
     "version.txt": "5b594206905a5399f040decbbdf1169b89ca191fcd452379f598f5002bc2ffb3"
