@@ -1,0 +1,61 @@
+name: Update Morning runtime manifest once
+
+on:
+  push:
+    branches: [agent/morning-production-hardening-20260825]
+    paths:
+      - ops/boatrace-morning-free/runtime/manifest.trigger
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/morning-production-hardening-20260825
+          fetch-depth: 0
+      - name: Generate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('ops/boatrace-morning-free/runtime')
+          names = [
+              'audit_overlay.py',
+              'run_with_digest.py',
+              'stage_guard.py',
+              'stage_lock.py',
+              'delivery_gate.py',
+          ]
+          payload = {
+              'schema_version': 'boatrace-morning-runtime-manifest-v1',
+              'contract_version': 'morning-prod-hardening-20260825-001',
+              'files': {
+                  name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                  for name in names
+              },
+          }
+          (root / 'runtime_manifest.json').write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + '\n',
+              encoding='utf-8',
+          )
+          PY
+          cd ops/boatrace-morning-free/runtime
+          python verify_runtime_manifest.py --manifest runtime_manifest.json
+      - name: Commit manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ops/boatrace-morning-free/runtime/runtime_manifest.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'Generate Morning runtime manifest'
+          git push origin HEAD:agent/morning-production-hardening-20260825
