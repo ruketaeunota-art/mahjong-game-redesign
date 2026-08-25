@@ -16,7 +16,7 @@ concurrency:
 
 env:
   ISSUE_NUMBER: '3'
-  MANIFEST_SHA256: '35cb91d2f049d7f7da5263b7799283ba86592b2a4a44202825877770b58c3514'
+  MANIFEST_SHA256: 'dfefec5d492415185db63f3c4d2a4c8a16341705c8eeb02ce47a47d9d4a39af0'
   CLOUDFLARE_ACCOUNT_ID: '0b518be7b875d0556c0ebab83cc50e0c'
   WORKER_NAME: 'boatrace-line-free'
   EXPECTED_SERVICE_VERSION: '0.2.6-skip-audit-v1-deploy-hardening'
@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Establish ephemeral key exchange
+      - name: Establish run-bound ephemeral key exchange
         id: relay
         shell: bash
         env:
@@ -49,6 +49,7 @@ jobs:
           public_key="$work/public.pem"
           encrypted_key="$work/relay-key.enc"
           relay_key="$work/relay.key"
+          relay_tag="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           post_comment() {
             gh api --method POST \
@@ -61,19 +62,20 @@ jobs:
             -out "$private_key" >/dev/null 2>&1
           openssl pkey -in "$private_key" -pubout -out "$public_key" >/dev/null 2>&1
           public_b64="$(base64 -w 0 "$public_key")"
-          post_comment "RELAY_PUBLIC_KEY_V1:${public_b64}"
+          post_comment "RELAY_PUBLIC_KEY_V2:${relay_tag}:${public_b64}"
 
           relay_cipher=""
+          prefix="RELAY_KEY_CIPHERTEXT_V2:${relay_tag}:"
           for _ in $(seq 1 210); do
             relay_cipher="$(
               gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
-                | jq -r '[.[] | .body | select(startswith("RELAY_KEY_CIPHERTEXT_V1:")) | sub("^RELAY_KEY_CIPHERTEXT_V1:"; "")] | last // empty'
+                | jq -r --arg prefix "$prefix" '[.[] | .body | select(startswith($prefix)) | sub("^" + $prefix; "")] | last // empty'
             )"
             if [ -n "$relay_cipher" ]; then break; fi
             sleep 2
           done
           if [ -z "$relay_cipher" ] || ! [[ "$relay_cipher" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-            post_comment 'RELAY_RESULT_V1:FAILED:ENCRYPTED_KEY_TIMEOUT'
+            post_comment "RELAY_RESULT_V2:${relay_tag}:FAILED:ENCRYPTED_KEY_TIMEOUT"
             exit 31
           fi
 
@@ -86,18 +88,21 @@ jobs:
             -pkeyopt rsa_oaep_md:sha256 \
             -pkeyopt rsa_mgf1_md:sha256
           if ! [[ "$(cat "$relay_key")" =~ ^[a-f0-9]{64}$ ]]; then
-            post_comment 'RELAY_RESULT_V1:FAILED:INVALID_RELAY_KEY'
+            post_comment "RELAY_RESULT_V2:${relay_tag}:FAILED:INVALID_RELAY_KEY"
             exit 32
           fi
           echo "work=$work" >> "$GITHUB_OUTPUT"
           echo "relay_key=$relay_key" >> "$GITHUB_OUTPUT"
-          echo "Ephemeral relay key accepted."
+          echo "relay_tag=$relay_tag" >> "$GITHUB_OUTPUT"
+          echo 'Ephemeral relay key accepted.'
 
       - name: Decrypt manifest and reconstruct private source
         shell: bash
         env:
           RELAY_WORK: ${{ steps.relay.outputs.work }}
           RELAY_KEY_FILE: ${{ steps.relay.outputs.relay_key }}
+          RELAY_TAG: ${{ steps.relay.outputs.relay_tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
@@ -121,13 +126,15 @@ jobs:
           manifest = json.loads(pathlib.Path(os.environ['RELAY_WORK'], 'source-manifest.json').read_text())
           if manifest.get('schema_version') != 'boatrace-cloudflare-secure-source-manifest-v1':
               raise SystemExit('INVALID_SOURCE_MANIFEST')
+          if manifest.get('source_commit') != 'e258e967d7feeec0827179f9f998b55b68f6da55':
+              raise SystemExit('SOURCE_COMMIT_MISMATCH')
           for entry in manifest.get('files', []):
               rel = pathlib.PurePosixPath(entry['path'])
               if rel.is_absolute() or '..' in rel.parts:
                   raise SystemExit('INVALID_SOURCE_PATH')
               target = root.joinpath(*rel.parts)
               target.parent.mkdir(parents=True, exist_ok=True)
-              request = urllib.request.Request(entry['url'], headers={'User-Agent': 'boatrace-secure-deploy-relay/1.0'})
+              request = urllib.request.Request(entry['url'], headers={'User-Agent': 'boatrace-secure-deploy-relay/2.0'})
               try:
                   with urllib.request.urlopen(request, timeout=30) as response:
                       data = response.read()
@@ -164,6 +171,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELAY_TAG: ${{ steps.relay.outputs.relay_tag }}
         run: |
           set -euo pipefail
           login_log="$RUNNER_TEMP/wrangler-device-login.log"
@@ -175,8 +183,28 @@ jobs:
           set -e
 
           device_code=""
-          for _ in $(seq 1 120); do
-            device_code="$(grep -Eo '[A-Z0-9]{4}-[A-Z0-9]{4}' "$login_log" | tail -n 1 || true)"
+          verify_url=""
+          for _ in $(seq 1 180); do
+            verify_url="$(grep -Eo 'https://dash\.cloudflare\.com/oauth2/device/verify\?user_code=[A-Za-z0-9]+' "$login_log" | tail -n 1 || true)"
+            if [ -n "$verify_url" ]; then
+              device_code="${verify_url##*user_code=}"
+            fi
+            if [ -z "$device_code" ]; then
+              device_code="$(python - "$login_log" <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          patterns = [
+              r'user_code=([A-Za-z0-9]{6,12})',
+              r'(?:code|Code)\s*[:=]\s*([A-Za-z0-9]{8})',
+          ]
+          for pattern in patterns:
+              matches = re.findall(pattern, text)
+              if matches:
+                  print(matches[-1])
+                  break
+          PY
+              )"
+            fi
             if [ -n "$device_code" ]; then break; fi
             if ! kill -0 "$login_pid" 2>/dev/null; then break; fi
             sleep 0.5
@@ -185,18 +213,21 @@ jobs:
             wait "$login_pid" || true
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-              -f body='RELAY_RESULT_V1:FAILED:DEVICE_CODE_NOT_EMITTED' >/dev/null
+              -f body="RELAY_RESULT_V2:${RELAY_TAG}:FAILED:DEVICE_CODE_NOT_EMITTED" >/dev/null
             exit 34
           fi
 
+          if [ -z "$verify_url" ]; then
+            verify_url="https://dash.cloudflare.com/oauth2/device/verify?user_code=${device_code}"
+          fi
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-            -f body="CLOUDFLARE_DEVICE_V1:${device_code}" >/dev/null
+            -f body="CLOUDFLARE_DEVICE_V2:${RELAY_TAG}:${device_code}:${verify_url}" >/dev/null
 
           if ! wait "$login_pid"; then
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
-              -f body='RELAY_RESULT_V1:FAILED:CLOUDFLARE_DEVICE_AUTH' >/dev/null
+              -f body="RELAY_RESULT_V2:${RELAY_TAG}:FAILED:CLOUDFLARE_DEVICE_AUTH" >/dev/null
             exit 35
           fi
           npx wrangler whoami >/dev/null
@@ -208,6 +239,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELAY_TAG: ${{ steps.relay.outputs.relay_tag }}
         run: |
           set -euo pipefail
           deploy_log="$RUNNER_TEMP/wrangler-deploy.log"
@@ -237,7 +269,7 @@ jobs:
             version_id="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$deploy_log" | tail -n 1 || true)"
           fi
 
-          body="RELAY_RESULT_V1:PASS\nworker=${WORKER_NAME}\nservice_version=${service_version}\nservice_name=${service_name}\nversion_id=${version_id:-unknown}\nsource_manifest_sha256=${MANIFEST_SHA256}\nworkflow_run_id=${GITHUB_RUN_ID}"
+          body="RELAY_RESULT_V2:${RELAY_TAG}:PASS\nworker=${WORKER_NAME}\nservice_version=${service_version}\nservice_name=${service_name}\nversion_id=${version_id:-unknown}\nsource_manifest_sha256=${MANIFEST_SHA256}\nworkflow_run_id=${GITHUB_RUN_ID}"
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
             -f body="$body" >/dev/null
