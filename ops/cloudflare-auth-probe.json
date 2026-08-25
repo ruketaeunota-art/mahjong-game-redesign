@@ -1,0 +1,9 @@
+{
+  "schema_version": "cloudflare-auth-probe-v1",
+  "configured": false,
+  "verified": false,
+  "http_status": 0,
+  "workflow_run_id": "32906884689",
+  "checked_at_utc": "2026-08-25T22:35:46Z",
+  "secret_value_recorded": false
+}
