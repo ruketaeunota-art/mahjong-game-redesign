@@ -7,8 +7,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.github/workflows/boatrace-morning-free.yml'
-      - 'ops/boatrace-morning-free/runtime/**'
+      - 'ops/boatrace-morning-free/recovery.trigger'
   workflow_dispatch:
     inputs:
       target_date:
@@ -46,11 +45,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: Checkout exact production runtime
+      - name: Checkout current production main
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: main
           fetch-depth: 0
+
+      - name: Capture exact source commit
+        shell: bash
+        run: echo "SOURCE_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -75,7 +78,11 @@ jobs:
           if [ -z "$stage" ]; then
             case "${EVENT_SCHEDULE:-}" in
               '30 23 * * *') stage=LATE ;;
-              *) stage=EARLY ;;
+              '0 22 * * *') stage=EARLY ;;
+              *)
+                clock="$(TZ=Asia/Tokyo date +%H%M)"
+                if [ "$clock" -ge 830 ]; then stage=LATE; else stage=EARLY; fi
+                ;;
             esac
           fi
           [[ "$target" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
@@ -115,6 +122,7 @@ jobs:
           echo "::add-mask::$database_url"
           if [ -n "$password" ]; then echo "::add-mask::$password"; fi
           echo "DATABASE_URL=$database_url" >> "$GITHUB_ENV"
+          echo "LEASE_EXPIRES_AT=$expires_at" >> "$GITHUB_ENV"
           echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
           rm -f /tmp/db-lease.json
 
@@ -136,6 +144,7 @@ jobs:
 
           CODE=0
           SKIPPED=false
+          VERIFY_EXISTING=false
           DISPOSITION=EXECUTED
           RUN_ID=""
           EXPECTED_SKIP_COUNT=""
@@ -194,8 +203,10 @@ jobs:
                 stage_guard.py \
                 stage_lock.py \
                 delivery_gate.py \
-                verify_runtime_manifest.py && \
-              python verify_runtime_manifest.py --manifest runtime_manifest.json
+                verify_runtime_manifest.py \
+                test_runtime_hardening.py && \
+              python verify_runtime_manifest.py --manifest runtime_manifest.json && \
+              python -m unittest -q test_runtime_hardening.py
             ) > "$LOG" 2>&1
             CODE=$?
             set -e
@@ -211,6 +222,7 @@ jobs:
             set -e
             if [ "$GUARD_CODE" -eq 10 ]; then
               SKIPPED=true
+              VERIFY_EXISTING=true
               DISPOSITION=SKIPPED_ALREADY_STARTED
             elif [ "$GUARD_CODE" -ne 0 ]; then
               CODE=$GUARD_CODE
@@ -282,12 +294,31 @@ jobs:
             else
               DISPOSITION=PASS_DELIVERED
             fi
+          elif [ "$CODE" -eq 0 ] && [ "$VERIFY_EXISTING" = true ]; then
+            set +e
+            python "$RUNTIME_DIR/delivery_gate.py" \
+              --target-date "$TARGET_DATE" \
+              --stage "$MORNING_STAGE" \
+              --allow-legacy \
+              --evidence-file "$DELIVERY_EVIDENCE" \
+              --timeout-seconds 30 \
+              --poll-seconds 2 >> "$LOG" 2>&1
+            DELIVERY_CODE=$?
+            set -e
+            if [ "$DELIVERY_CODE" -ne 0 ]; then
+              CODE=$DELIVERY_CODE
+              DISPOSITION=EXISTING_DELIVERY_GATE_FAILED
+            else
+              RUN_ID="$(jq -r '.run_execution_id // empty' "$DELIVERY_EVIDENCE")"
+              EXPECTED_SKIP_COUNT="$(jq -r '.expected_skip_count // empty' "$DELIVERY_EVIDENCE")"
+              DISPOSITION=SKIPPED_ALREADY_STARTED_DELIVERY_VERIFIED
+            fi
           fi
 
           cleanup_lock
           trap - EXIT
 
-          export CODE SKIPPED DISPOSITION LOG RUN_ID EXPECTED_SKIP_COUNT LOCK_READY DELIVERY_EVIDENCE
+          export CODE SKIPPED VERIFY_EXISTING DISPOSITION LOG RUN_ID EXPECTED_SKIP_COUNT LOCK_READY DELIVERY_EVIDENCE
           python - <<'PY'
           import json
           import os
@@ -308,6 +339,7 @@ jobs:
               'exit_code': int(os.environ['CODE']),
               'success': int(os.environ['CODE']) == 0,
               'skipped': os.environ['SKIPPED'] == 'true',
+              'verified_existing_delivery': os.environ['VERIFY_EXISTING'] == 'true',
               'disposition': os.environ['DISPOSITION'],
               'force_replay': os.environ.get('FORCE_REPLAY') == 'true',
               'run_execution_id': int(os.environ['RUN_ID']) if os.environ.get('RUN_ID') else None,
@@ -317,7 +349,8 @@ jobs:
               'runtime_contract_version': 'morning-prod-hardening-20260825-001',
               'event_name': os.environ.get('GITHUB_EVENT_NAME'),
               'event_schedule': os.environ.get('EVENT_SCHEDULE') or None,
-              'source_commit_sha': os.environ.get('GITHUB_SHA'),
+              'source_commit_sha': os.environ.get('SOURCE_COMMIT_SHA'),
+              'workflow_trigger_sha': os.environ.get('GITHUB_SHA'),
               'workflow_run_id': os.environ.get('GITHUB_RUN_ID'),
               'workflow_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
               'lease_expires_at': os.environ.get('LEASE_EXPIRES_AT'),
@@ -335,8 +368,6 @@ jobs:
           echo "disposition=$DISPOSITION" >> "$GITHUB_OUTPUT"
           tail -n 160 "$LOG" || true
           exit 0
-        env:
-          LEASE_EXPIRES_AT: ${{ steps.lease.outputs.expires_at }}
 
       - name: Persist sanitized production evidence
         if: always()
@@ -354,7 +385,8 @@ jobs:
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "Record BOAT RACE Morning ${TARGET_DATE} ${MORNING_STAGE} production"
           for attempt in 1 2 3; do
-            if git pull --rebase origin main && git push origin HEAD:main; then exit 0; fi
+            if git push origin HEAD:main; then exit 0; fi
+            git pull --rebase origin main
           done
           exit 70
 
