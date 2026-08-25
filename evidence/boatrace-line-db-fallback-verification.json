@@ -1,21 +1,35 @@
 {
-  "schema_version": "boatrace-line-db-fallback-verification-v2",
-  "recorded_at_utc": "2026-08-25T06:11:13.590317+00:00",
-  "read_only_verification": true,
+  "schema_version": "boatrace-line-db-fallback-verification-v3",
+  "recorded_at_utc": "2026-08-25T06:22:01+00:00",
+  "status": "READY_NEXT_DIGEST",
+  "read_only_database_verification": true,
   "notification_requeued": false,
-  "latest_skip_audit_event": null,
-  "trigger": {
-    "tgenabled": "O"
+  "duplicate_notification_sent": false,
+  "cloudflare_redeploy_required_for_text_fallback": false,
+  "cloudflare_redeploy_performed": false,
+  "database": {
+    "enrichment_function_present": true,
+    "enrichment_trigger_present": true,
+    "enrichment_trigger_enabled": true,
+    "trigger_enabled_code": "O"
   },
-  "function_present": {
-    "present": true
+  "production_runtime": {
+    "skip_audit_overlay_present": true,
+    "digest_wrapper_imports_overlay_before_capture": true,
+    "binding_verification": "PASS",
+    "runtime_commit_sha": "cd1f38c551dc7c5ee0709047606550cbb0c36c93",
+    "verification_workflow_run_id": "32816393695"
   },
-  "latest_morning_digest": null,
-  "query_errors": [
-    {
-      "query": "latest_morning_digest",
-      "error_type": "InsufficientPrivilege"
-    }
-  ],
-  "status": "BLOCKED"
+  "delivery_path": {
+    "payload_presentation": "MORNING_CARD_V2",
+    "existing_worker_behavior": "V1_RENDER_REJECT_THEN_CANONICAL_TEXT_FALLBACK",
+    "canonical_text_contains_skip_breakdown": true,
+    "canonical_text_contains_ev_disclaimer": true
+  },
+  "first_post_patch_delivery_observed": false,
+  "first_post_patch_delivery_pending": true,
+  "next_scheduled_run_jst": "2026-08-26T07:00:00+09:00",
+  "today_original_digest_changed": false,
+  "today_original_three_races_recovered": false,
+  "limitation": "The first newly generated Morning digest after the runtime patch has not yet executed; live LINE delivery of the enriched text will be confirmed by that run."
 }
