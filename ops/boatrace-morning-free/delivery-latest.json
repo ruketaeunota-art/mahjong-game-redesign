@@ -1,10 +1,10 @@
 {
-  "attempts": 29,
+  "attempts": 1,
   "error_code": null,
   "error_type": null,
   "expected_skip_count": 4,
   "legacy_run": false,
-  "recorded_at_utc": "2026-08-25T22:34:16.635020+00:00",
+  "recorded_at_utc": "2026-08-25T22:40:45.017097+00:00",
   "run_execution_id": 34,
   "schema_version": "boatrace-morning-delivery-gate-v2",
   "snapshot": {
@@ -21,8 +21,8 @@
     "status": "ACCEPTED",
     "ui_version": "MORNING_USER_CARD_V3"
   },
-  "stage": null,
-  "started_at_utc": "2026-08-25T22:33:18.584442+00:00",
+  "stage": "EARLY",
+  "started_at_utc": "2026-08-25T22:40:44.840421+00:00",
   "status": "PASS_ACCEPTED",
-  "target_date": null
+  "target_date": "2026-08-26"
 }
