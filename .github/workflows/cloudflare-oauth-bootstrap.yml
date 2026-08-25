@@ -1,0 +1,99 @@
+name: Bootstrap persistent Cloudflare deployment credential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ops/cloudflare-oauth-bootstrap/start.trigger
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: cloudflare-oauth-bootstrap
+  cancel-in-progress: false
+
+env:
+  DATA_API_URL: https://ep-weathered-cloud-ax67iew3.apirest.c-4.us-east-2.aws.neon.tech/neondb/rest/v1
+  OIDC_AUDIENCE: neon-boatrace-cloudflare-bootstrap
+  CLOUDFLARE_ACCOUNT_ID: 0b518be7b875d0556c0ebab83cc50e0c
+  WORKER_NAME: boatrace-line-free
+  OPS_DIR: ops/cloudflare-oauth-bootstrap
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Acquire short-lived Neon deployment lease with GitHub OIDC
+        id: lease
+        shell: bash
+        run: |
+          set -euo pipefail
+          token_response="$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          jwt="$(jq -er '.value' <<<"$token_response")"
+          echo "::add-mask::$jwt"
+          curl -sS --fail-with-body \
+            -o /tmp/db-lease.json \
+            -X POST \
+            -H "Authorization: Bearer ${jwt}" \
+            -H 'Content-Type: application/json' \
+            "${DATA_API_URL}/rpc/boatrace_oidc_issue_db_lease" \
+            -d '{}'
+          jq -e '.ok == true and .role == "boatrace_cloudflare_deploy_runner" and (.database_url | type == "string")' /tmp/db-lease.json >/dev/null
+          database_url="$(jq -er '.database_url' /tmp/db-lease.json)"
+          expires_at="$(jq -er '.expires_at' /tmp/db-lease.json)"
+          echo "::add-mask::$database_url"
+          echo "DATABASE_URL=$database_url" >> "$GITHUB_ENV"
+          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+          rm -f /tmp/db-lease.json
+
+      - name: Install exact bootstrap dependencies
+        run: |
+          python -m pip install --disable-pip-version-check 'psycopg[binary]>=3.2,<4'
+          npm install --no-save --ignore-scripts wrangler@4.123.0
+
+      - name: Authenticate once, persist encrypted credential, deploy, and verify
+        shell: bash
+        run: bash ops/cloudflare-oauth-bootstrap/bootstrap.sh
+
+      - name: Revoke short-lived Neon deployment lease
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${DATABASE_URL:-}" ]; then
+            python - <<'PY'
+          import os
+          import psycopg
+          try:
+              with psycopg.connect(os.environ['DATABASE_URL']) as conn:
+                  with conn.cursor() as cur:
+                      cur.execute('SELECT public.boatrace_revoke_own_db_lease()')
+                      cur.fetchone()
+                  conn.commit()
+          except Exception as exc:
+              print(f'lease revoke warning: {type(exc).__name__}')
+          PY
+          fi
+          exit 0
