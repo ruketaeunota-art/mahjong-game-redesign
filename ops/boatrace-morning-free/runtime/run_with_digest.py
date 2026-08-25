@@ -8,6 +8,7 @@ from typing import Any
 
 import production  # noqa: F401  # applies the production parser/scoring overlays
 import runner
+import audit_overlay  # noqa: F401  # installs skip-audit persistence overlay
 
 _original_persist = runner.persist
 
