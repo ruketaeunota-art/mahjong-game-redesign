@@ -1,0 +1,61 @@
+name: Probe Cloudflare auth once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/cloudflare-auth-probe.trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Probe canonical token without exposing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ops
+          configured=false
+          verified=false
+          http_status=0
+          if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            configured=true
+            http_status="$(curl -sS -o /tmp/cf-verify.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H 'Content-Type: application/json' \
+              https://api.cloudflare.com/client/v4/user/tokens/verify || true)"
+            if [ "$http_status" = 200 ] && jq -e '.success == true and .result.status == "active"' /tmp/cf-verify.json >/dev/null 2>&1; then
+              verified=true
+            fi
+          fi
+          jq -n \
+            --argjson configured "$configured" \
+            --argjson verified "$verified" \
+            --arg http_status "$http_status" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg checked_at "$(date -u +%FT%TZ)" \
+            '{schema_version:"cloudflare-auth-probe-v1",configured:$configured,verified:$verified,http_status:($http_status|tonumber),workflow_run_id:$run_id,checked_at_utc:$checked_at,secret_value_recorded:false}' \
+            > ops/cloudflare-auth-probe.json
+          rm -f /tmp/cf-verify.json
+      - name: Persist sanitized result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add ops/cloudflare-auth-probe.json
+          git commit -m 'Record Cloudflare auth probe' || exit 0
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
