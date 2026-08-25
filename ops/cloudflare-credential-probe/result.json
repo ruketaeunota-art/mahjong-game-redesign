@@ -1,0 +1,12 @@
+{
+  "recorded_at_utc": "2026-08-25T05:12:35.873984+00:00",
+  "token_present": false,
+  "token_source": "none",
+  "configured_account_source": "hardcoded",
+  "configured_account_matches_expected": true,
+  "token_verify_http": 0,
+  "token_verify_success": false,
+  "expected_account_http": 0,
+  "expected_account_access_success": false,
+  "secrets_exposed": false
+}
