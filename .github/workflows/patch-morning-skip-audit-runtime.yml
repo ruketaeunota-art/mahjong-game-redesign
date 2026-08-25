@@ -1,0 +1,75 @@
+name: Patch Morning skip-audit runtime once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ops/boatrace-morning-free/enable-skip-audit.trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patch-morning-skip-audit-runtime
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Patch runtime import and verify overlay binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('ops/boatrace-morning-free/runtime/run_with_digest.py')
+          text = path.read_text(encoding='utf-8')
+          marker = 'import audit_overlay  # noqa: F401  # installs skip-audit persistence overlay\n'
+          if marker not in text:
+              needle = 'import production  # noqa: F401  # applies the production parser/scoring overlays\nimport runner\n\n_original_persist = runner.persist\n'
+              replacement = 'import production  # noqa: F401  # applies the production parser/scoring overlays\nimport runner\nimport audit_overlay  # noqa: F401  # installs skip-audit persistence overlay\n\n_original_persist = runner.persist\n'
+              if needle not in text:
+                  raise SystemExit('run_with_digest import marker not found')
+              path.write_text(text.replace(needle, replacement, 1), encoding='utf-8')
+          PY
+          python -m py_compile \
+            ops/boatrace-morning-free/runtime/runner.py \
+            ops/boatrace-morning-free/runtime/production.py \
+            ops/boatrace-morning-free/runtime/audit_overlay.py \
+            ops/boatrace-morning-free/runtime/run_with_digest.py
+          (
+            cd ops/boatrace-morning-free/runtime
+            python - <<'PY'
+          import run_with_digest
+          assert run_with_digest._original_persist.__name__ == 'persist_with_skip_audit'
+          assert run_with_digest.runner.persist.__name__ == 'persist_with_digest'
+          print('skip-audit overlay binding: PASS')
+          PY
+          )
+
+      - name: Commit production runtime patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            ops/boatrace-morning-free/runtime/audit_overlay.py \
+            ops/boatrace-morning-free/runtime/run_with_digest.py
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Enable Morning skip-audit details in production runtime'
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              exit 0
+            fi
+          done
+          exit 90
