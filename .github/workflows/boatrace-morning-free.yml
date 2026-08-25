@@ -140,6 +140,140 @@ jobs:
           )"
           echo "already_succeeded=$already" >> "$GITHUB_OUTPUT"
 
+      - name: Verify LINE skip-detail DB fallback state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import psycopg
+          from psycopg.rows import dict_row
+
+          result = {
+              'schema_version': 'boatrace-line-db-fallback-verification-v2',
+              'recorded_at_utc': datetime.now(timezone.utc).isoformat(),
+              'read_only_verification': True,
+              'notification_requeued': False,
+              'latest_skip_audit_event': None,
+              'trigger': None,
+              'function_present': None,
+              'latest_morning_digest': None,
+              'query_errors': [],
+              'status': 'UNKNOWN',
+          }
+
+          def one(label, sql):
+              try:
+                  with psycopg.connect(os.environ['DATABASE_URL'], row_factory=dict_row) as conn:
+                      conn.execute('SET TRANSACTION READ ONLY')
+                      with conn.cursor() as cur:
+                          cur.execute(sql)
+                          row = cur.fetchone()
+                          return None if row is None else dict(row)
+              except Exception as exc:
+                  result['query_errors'].append({'query': label, 'error_type': type(exc).__name__})
+                  return None
+
+          result['latest_skip_audit_event'] = one('latest_skip_audit_event', '''
+              SELECT
+                r.id AS run_execution_id,
+                r.target_date::text AS target_date,
+                r.stage,
+                e.event_seq,
+                e.lifecycle_status,
+                e.outcome,
+                e.actionable_count,
+                e.s_count,
+                e.a_count,
+                e.details->>'skip_audit_version' AS skip_audit_version,
+                CASE WHEN COALESCE(e.details->>'skip_audit_count','') ~ '^\\d+$'
+                     THEN (e.details->>'skip_audit_count')::integer ELSE NULL END AS skip_audit_count
+              FROM ux_app.run_executions r
+              JOIN LATERAL (
+                SELECT x.* FROM ux_app.run_events x
+                WHERE x.run_execution_id=r.id
+                ORDER BY x.event_seq DESC LIMIT 1
+              ) e ON true
+              WHERE e.details->>'skip_audit_version'='morning-skip-audit-v1'
+              ORDER BY r.id DESC LIMIT 1
+          ''')
+
+          result['function_present'] = one('function_present', '''
+              SELECT EXISTS (
+                SELECT 1 FROM pg_proc p
+                JOIN pg_namespace n ON n.oid=p.pronamespace
+                WHERE n.nspname='ux_app'
+                  AND p.proname='enrich_morning_digest_skip_audit_v1'
+              ) AS present
+          ''')
+
+          result['trigger'] = one('trigger', '''
+              SELECT t.tgenabled
+              FROM pg_trigger t
+              JOIN pg_class c ON c.oid=t.tgrelid
+              JOIN pg_namespace n ON n.oid=c.relnamespace
+              WHERE n.nspname='ux_app'
+                AND c.relname='notification_outbox'
+                AND t.tgname='morning_digest_skip_audit_enrichment'
+                AND NOT t.tgisinternal
+              LIMIT 1
+          ''')
+
+          result['latest_morning_digest'] = one('latest_morning_digest', '''
+              SELECT
+                o.id,
+                o.run_execution_id,
+                o.status,
+                o.created_at::text AS created_at,
+                o.accepted_at::text AS accepted_at,
+                (o.provider_message_id IS NOT NULL) AS provider_message_id_present,
+                o.payload->>'presentation' AS presentation,
+                o.payload->>'ui_version' AS ui_version,
+                o.payload->>'skip_audit_version' AS skip_audit_version,
+                CASE WHEN jsonb_typeof(o.payload->'skip_summary_lines')='array'
+                     THEN jsonb_array_length(o.payload->'skip_summary_lines') ELSE 0 END AS skip_summary_line_count,
+                POSITION('見送り内訳' IN COALESCE(o.payload->>'canonical_text','')) > 0 AS canonical_has_skip_breakdown,
+                POSITION('実オッズEVはこの通知では未評価' IN COALESCE(o.payload->>'canonical_text','')) > 0 AS canonical_has_ev_disclaimer
+              FROM ux_app.notification_outbox o
+              WHERE o.event_kind='MORNING_DIGEST'
+              ORDER BY o.id DESC LIMIT 1
+          ''')
+
+          event = result['latest_skip_audit_event'] or {}
+          trigger = result['trigger'] or {}
+          function_present = result['function_present'] or {}
+          digest = result['latest_morning_digest'] or {}
+          generated = (
+              event.get('skip_audit_version') == 'morning-skip-audit-v1'
+              and isinstance(event.get('skip_audit_count'), int)
+              and event.get('skip_audit_count', 0) > 0
+          )
+          enrichment_ready = bool(function_present.get('present') and trigger.get('tgenabled') in ('O', 'A'))
+          delivered = bool(
+              digest.get('presentation') == 'MORNING_CARD_V2'
+              and digest.get('canonical_has_skip_breakdown')
+              and digest.get('canonical_has_ev_disclaimer')
+              and digest.get('status') in ('SENT', 'DELIVERED', 'ACCEPTED')
+          )
+          if delivered:
+              result['status'] = 'PASS_DELIVERED'
+          elif generated and enrichment_ready:
+              result['status'] = 'READY_NEXT_DIGEST'
+          elif generated:
+              result['status'] = 'RUN_EVENT_READY_OUTBOX_UNVERIFIED'
+          else:
+              result['status'] = 'BLOCKED'
+
+          Path('evidence/boatrace-line-db-fallback-verification.json').write_text(
+              json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+          )
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
       - name: Compile and execute frozen Morning production
         id: run
         shell: bash
@@ -211,7 +345,7 @@ jobs:
           PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add ops/boatrace-morning-free/last-run.json
+          git add ops/boatrace-morning-free/last-run.json evidence/boatrace-line-db-fallback-verification.json
           if ! git diff --cached --quiet; then
             git commit -m "Record BOAT RACE Morning ${TARGET_DATE} ${MORNING_STAGE} production"
             pushed=false
