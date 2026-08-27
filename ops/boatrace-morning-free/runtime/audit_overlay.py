@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import late_diff
 import runner
 
 
@@ -10,7 +11,11 @@ def _skip_record(race: dict[str, Any], deadline: datetime) -> dict[str, Any]:
     signals = list(race.get('signals') or [])
     strongest = max(signals, key=lambda item: float(item.get('strength') or 0.0), default=None)
     max_strength = float(strongest.get('strength') or 0.0) if strongest else 0.0
-    reasons = ['MORNING_GRADE_B', 'SA_THRESHOLD_NOT_MET']
+    reasons = [
+        *list(race.get('reason_codes') or []),
+        'MORNING_GRADE_B',
+        'SA_THRESHOLD_NOT_MET',
+    ]
     if race.get('feature_degraded'):
         reasons.append('FEATURE_DEGRADED')
     return {
@@ -18,7 +23,7 @@ def _skip_record(race: dict[str, Any], deadline: datetime) -> dict[str, Any]:
         'race_no': int(race['race_no']),
         'official_deadline_at': deadline.isoformat(),
         'morning_grade': str(race.get('race_grade') or 'B'),
-        'reason_codes': reasons,
+        'reason_codes': sorted(set(reasons)),
         'max_signal_strength': round(max_strength, 6),
         'sa_strength_threshold': 1.75,
         'strongest_signal': (
@@ -45,7 +50,13 @@ def persist_with_skip_audit(
     scored: list[dict[str, Any]],
     source_failures: list[str],
     now: datetime,
-) -> dict[str, int]:
+) -> dict[str, Any]:
+    source_evidence = runner.source_manifest()
+    source_artifact_sha256 = runner.source_manifest_sha256()
+    scorer_artifact_sha256 = runner.sha({
+        'schema_version': 'boatrace-morning-scorer-output-manifest-v1',
+        'races': scored,
+    })
     owned: list[tuple[dict[str, Any], datetime]] = []
     for race in scored:
         deadline = runner.dt_deadline(target, race['deadline_time_jst'])
@@ -70,6 +81,12 @@ def persist_with_skip_audit(
         for race, deadline in actionable
         if race['race_grade'] not in ('S', 'A')
     ]
+    morning_evaluations = late_diff.build_full_evaluations(
+        scored,
+        target_date=target,
+        stage=stage,
+        now=now,
+    )
 
     for race, deadline in candidates:
         payload = {
@@ -107,7 +124,7 @@ def persist_with_skip_audit(
             (
                 projection_key, rid, target, race['venue_code'], race['race_no'], deadline,
                 race['race_grade'], race['race_grade'], runner.SOURCE_REF,
-                runner.sha(runner.SOURCE_REF.encode()), runner.Jsonb(payload), payload_sha,
+                source_artifact_sha256, runner.Jsonb(payload), payload_sha,
             ),
         )
 
@@ -120,14 +137,7 @@ def persist_with_skip_audit(
     for race, deadline in s_candidates:
         if not race['tickets']:
             continue
-        entrants = [
-            {
-                'lane': entrant['lane'],
-                'racer_registration_no': entrant['racer_no'],
-                'racer_name': entrant['racer_name'],
-            }
-            for entrant in race['entrants']
-        ]
+        entrants = runner.build_handoff_entrants(race['entrants'])
         payload = {
             'schema_version': 'purchase-assist-handoff-v2',
             'target_date': target.isoformat(),
@@ -161,7 +171,7 @@ def persist_with_skip_audit(
             (
                 handoff_key, target, race['venue_code'], race['race_no'], deadline,
                 logic, runner.PURCHASE_POLICY, runner.SOURCE_REF,
-                runner.sha(runner.SOURCE_REF.encode()), payload['morning_hypothesis'],
+                scorer_artifact_sha256, payload['morning_hypothesis'],
                 runner.Jsonb(race['tickets']), runner.Jsonb(entrants),
                 runner.Jsonb(payload), payload_sha,
             ),
@@ -170,6 +180,23 @@ def persist_with_skip_audit(
             handoffs += 1
 
     source_state = 'SOURCE_OK' if not source_failures else 'PARTIAL_SOURCE'
+    v2_digest_enabled = late_diff.v2_rpc_available(cur)
+    legacy_semantics: dict[str, Any] | None = None
+    legacy_late_diff_result: dict[str, Any] | None = None
+    if not v2_digest_enabled:
+        legacy_semantics = late_diff.build_legacy_semantics(
+            morning_evaluations,
+            source_state=source_state,
+            history_state='DEGRADED_HISTORY',
+            feature_state='FEATURE_DEGRADED',
+        )
+        legacy_late_diff_result = late_diff.evaluate_legacy_preterminal_suppression(
+            cur,
+            run_execution_id=rid,
+            target_date=target,
+            stage=stage,
+            semantic_result=legacy_semantics,
+        )
     outcome = (
         'CANDIDATES_FOUND'
         if candidates
@@ -181,11 +208,30 @@ def persist_with_skip_audit(
         'full_inspected_count': len(scored),
         'full_actionable_count': len(actionable),
         'source_failures': source_failures[:100],
+        'source_manifest': source_evidence,
+        'source_manifest_sha256': source_artifact_sha256,
+        'source_artifact_count': len(source_evidence['artifacts']),
+        'scorer_artifact_sha256': scorer_artifact_sha256,
+        'morning_evaluation_input_version': 'FULL_SCORED_DAY_V1',
+        'morning_evaluation_input_count': len(morning_evaluations),
+        'morning_digest_v2_capability': v2_digest_enabled,
         'degraded': True,
         'top3_structural_overlay_suppressed': True,
         'skip_audit_version': 'morning-skip-audit-v1',
         'skip_audit_count': len(skipped),
         'skip_audit': skipped,
+        **(
+            late_diff.legacy_semantic_detail_fields(legacy_semantics)
+            if legacy_semantics is not None
+            else {}
+        ),
+        **(
+            late_diff.legacy_suppression_audit_fields(
+                legacy_late_diff_result
+            )
+            if stage == 'LATE' and legacy_late_diff_result is not None
+            else {}
+        ),
     }
     cur.execute(
         "INSERT INTO ux_app.run_events("
@@ -197,7 +243,7 @@ def persist_with_skip_audit(
         (
             rid, outcome, source_state, len(owned), len(actionable), len(s_candidates),
             len(a_candidates), handoffs, runner.SOURCE_REF,
-            runner.sha(runner.SOURCE_REF.encode()), runner.Jsonb(details),
+            source_artifact_sha256, runner.Jsonb(details),
         ),
     )
     return {
@@ -206,6 +252,9 @@ def persist_with_skip_audit(
         's': len(s_candidates),
         'a': len(a_candidates),
         'handoff': handoffs,
+        '_morning_evaluations': morning_evaluations,
+        '_morning_digest_v2_enabled': v2_digest_enabled,
+        '_legacy_late_diff_result': legacy_late_diff_result,
     }
 
 

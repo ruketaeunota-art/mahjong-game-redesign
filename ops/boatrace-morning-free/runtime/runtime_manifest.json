@@ -1,16 +1,23 @@
 {
-  "contract_version": "morning-prod-hardening-20260825-001",
+  "contract_version": "morning-prod-late-diff-20260827-001",
   "files": {
-    "audit_overlay.py": "8542c5a9242de8aab1b84c26950ceb30a6caa1741ef9d73eefefbffe4c3faa6b",
-    "delivery_gate.py": "7ac4947e91f2c0e8a012e052b31e97a2a3fc62f2ee88e815d5e95825cf3eef4f",
-    "production.py": "20208edb99a078bebbd7d7488c0520bbe80a4d0323cf8ff7fcb9c49f320224ee",
-    "requirements.txt": "b659e5a3414b315339e30783cae996b92737733fd943f6a924fdefe346f4ac62",
-    "run_with_digest.py": "fb94f45cdaf264ae8586efb5a853df86064ee97c4a40f4951d7fd1cfaf2c6e9e",
-    "runner.py": "72c0c0bd4cdee5948807876c347acbf0eae9566f40c31971af0f07ce90c93d68",
-    "stage_guard.py": "2ca8bd8e1c9ee4d7d7784f20905be955bc7b9780525e8211892c4bef00cfe26f",
-    "stage_lock.py": "db7c438c5b6f2f089b03c961d552f45f0f3af228c3fdd1e580f1151d6ee4a544",
-    "verify_runtime_manifest.py": "51ecb1c88342b0cb9aae93aadacdff87c68a6428ef5cafe8472bc4991e314390",
-    "version.txt": "5b594206905a5399f040decbbdf1169b89ca191fcd452379f598f5002bc2ffb3"
+    "audit_overlay.py": "70a7a47a72ce559d0e8a76e26050e6cc6f6731e09080766284fcbac4bd53586f",
+    "delivery_gate.py": "a874229ec59db61908db1cc963355a49f6271536ed363718a078c97aec9757ac",
+    "late_diff.py": "f1ce8ee47803dd162119b725dd292b08e51a3e96cac05f3438364ca6e10977ac",
+    "production.py": "23f72bd6cacc4e61b7522ec55f871bbcf5f369b030c6df9ca8c5c974b1cab1ae",
+    "requirements.txt": "eac7173328816790cee3e79d7fae812307214492563290df37cebf886cc64b66",
+    "run_with_digest.py": "3e744174e1608f4e973bd9c003545103c48381dfc477a250c189b69d9bc949d4",
+    "runner.py": "4452d715a2ec747e2dcf9c4324d378899ce5a0bd194971f5fe07beaedb9b6229",
+    "stage_guard.py": "b580ba884c16fb0c6daa0a718bc5bfe4ea90d25f70d4c3b317e450f96e27fc0b",
+    "stage_lock.py": "dc7c420f2a40bdbea296552402f9f951d1b8aedb06f567c8df714751c6b49324",
+    "test_digest_wrapper.py": "66dc20f699008553fbe4478d58501aaa6434505dfc4947f20760330f331877fa",
+    "test_handoff_probabilities.py": "0a355000a846b8b78d69ed2e3c9cc20eebdbf6a78dfcfc20d8a8b9e5f69ba842",
+    "test_late_diff.py": "27968e8e6266ea410025587ed6b9cfbeb3311846f9ff8cf7a61e64aedd6fcb86",
+    "test_p4_integrity.py": "0f0a36678b35552c2cda8ba4e9d3d3857cde1f1eaea5201110aef83fedf5a825",
+    "test_p5_event_day_ood.py": "ebfc5f9f0edf7522890f39345ecb9abd7be98d930ae9a7c6fcefbac04b6228d8",
+    "test_runtime_hardening.py": "92151ee5c83676d5f12258c884cda1d2a6c9ac351a67392f5d9be0fb598d1cb0",
+    "verify_runtime_manifest.py": "33cf44fccf4eb19af77f3eee84f337dfa404d5f2053683f04601d9b6c96770a0",
+    "version.txt": "0344be638af198e55fa4ac88bd47e91520bdad51d6bb0ca6a1631e2dce138390"
   },
   "schema_version": "boatrace-morning-runtime-manifest-v1"
 }

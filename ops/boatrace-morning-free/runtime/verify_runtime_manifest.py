@@ -50,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
 
     wrapper_path = manifest_path.parent / "run_with_digest.py"
     wrapper = wrapper_path.read_text(encoding="utf-8")
-    binding_ok = "import audit_overlay" in wrapper
+    binding_ok = (
+        "import audit_overlay" in wrapper
+        and "append_morning_digest_v2" in wrapper
+        and "append_morning_digest_v1" in wrapper
+    )
     failed = failed or not binding_ok
 
     version_path = manifest_path.parent / "version.txt"
@@ -66,12 +70,19 @@ def main(argv: list[str] | None = None) -> int:
         "runner.py",
         "production.py",
         "audit_overlay.py",
+        "late_diff.py",
         "run_with_digest.py",
         "stage_guard.py",
         "stage_lock.py",
         "delivery_gate.py",
         "verify_runtime_manifest.py",
         "requirements.txt",
+        "test_digest_wrapper.py",
+        "test_handoff_probabilities.py",
+        "test_late_diff.py",
+        "test_p4_integrity.py",
+        "test_p5_event_day_ood.py",
+        "test_runtime_hardening.py",
         "version.txt",
     }
     coverage_ok = required_files.issubset(files)

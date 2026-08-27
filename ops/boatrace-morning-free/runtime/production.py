@@ -19,11 +19,23 @@ def _priority(strength: float) -> str:
 
 def corrected_score_race(r: dict[str, Any], v2: dict[str, Any], v21: dict[str, Any]) -> dict[str, Any]:
     out = _original_score(r, v2, v21)
+    if out.get('model_applicability') == runner.MODEL_APPLICABILITY_OOD:
+        if (
+            out.get('race_grade') != 'B'
+            or out.get('decision_state') != 'SKIP'
+            or out.get('signals') != []
+            or out.get('tickets') != []
+            or runner.MODEL_OOD_EVENT_DAY not in out.get('reason_codes', [])
+            or runner.MODEL_OOD_EVENT_DAY not in out.get('degradation_codes', [])
+        ):
+            raise RuntimeError('MODEL_OOD_EVENT_DAY_INVARIANT_FAILED')
+        return out
     entrant_by_lane = {int(e['lane']): e for e in out['entrants']}
     for e in out['entrants']:
-        missing_comment = bool(e.get('comment_missing'))
         missing_recent5 = bool(e.get('motor_recent5_missing'))
-        correct = max(0.60, 1.0 - 0.15 * int(missing_comment) - 0.25 * int(missing_recent5))
+        # Missing direct comments are a neutral zero under the frozen model;
+        # only unavailable recent-five motor evidence reduces confidence.
+        correct = max(0.60, 1.0 - 0.25 * int(missing_recent5))
         e['evidence_confidence'] = correct
     for signal in out['signals']:
         e = entrant_by_lane[int(signal['lane'])]
@@ -217,10 +229,11 @@ def deadline_map(racelist_html: str) -> dict[int, str]:
 
 
 def production_acquire(target: date) -> tuple[list[dict[str, Any]], list[str]]:
+    runner.reset_source_manifest()
     ds = target.strftime('%Y%m%d')
     races: list[dict[str, Any]] = []
     failures: list[str] = []
-    for venue, event_day in runner.discover(target):
+    for venue, context in runner.discover(target, failures):
         first_url = f'https://www.boatrace.jp/owpc/pc/race/racelist?hd={ds}&jcd={venue:02d}&rno=1'
         try:
             first_html = runner.get(first_url)
@@ -233,7 +246,10 @@ def production_acquire(target: date) -> tuple[list[dict[str, Any]], list[str]]:
             try:
                 html = first_html if rno == 1 else runner.get(url)
                 entrants = runner.extract_entrants(html)
-                races.append({'venue_code': venue, 'race_no': rno, 'event_day': event_day,
+                races.append({'venue_code': venue, 'race_no': rno,
+                    'event_day': context.event_day,
+                    'event_phase': context.event_phase,
+                    'event_day_label': context.event_day_label,
                     'deadline_time_jst': deadlines[rno], 'source_url': url,
                     'entrants': [entrant.__dict__ for entrant in entrants]})
             except Exception as exc:

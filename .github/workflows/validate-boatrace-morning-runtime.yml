@@ -30,7 +30,7 @@ jobs:
           cache-dependency-path: ops/boatrace-morning-free/runtime/requirements.txt
       - name: Install exact dependencies
         run: python -m pip install --requirement ops/boatrace-morning-free/runtime/requirements.txt
-      - name: Compile, verify manifest, and run hardening tests
+      - name: Compile, verify manifest, and run all runtime tests
         working-directory: ops/boatrace-morning-free/runtime
         run: |
           set -euo pipefail
@@ -38,11 +38,18 @@ jobs:
             runner.py \
             production.py \
             audit_overlay.py \
+            late_diff.py \
             run_with_digest.py \
             stage_guard.py \
             stage_lock.py \
             delivery_gate.py \
             verify_runtime_manifest.py \
+            test_digest_wrapper.py \
+            test_handoff_probabilities.py \
+            test_late_diff.py \
+            test_p4_integrity.py \
+            test_p5_event_day_ood.py \
             test_runtime_hardening.py
           python verify_runtime_manifest.py --manifest runtime_manifest.json
-          python -m unittest -v test_runtime_hardening.py
+          python -m unittest discover -v -p 'test_*.py'
+          python test_digest_wrapper.py

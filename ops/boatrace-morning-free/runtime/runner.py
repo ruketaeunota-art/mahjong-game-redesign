@@ -23,7 +23,13 @@ STAGE_POLICY = "deadline-partition-1000-jst-20260812-001"
 MORNING_POLICY = "s-a-20260812-001"
 PURCHASE_POLICY = "s-only-20260809-001"
 SOURCE_REF = "github-spec-rebuild:v2.1-frozen-neon-20260818"
+SOURCE_MANIFEST_SCHEMA = "boatrace-official-http-manifest-v1"
+MODEL_OOD_EVENT_DAY = "MODEL_OOD_EVENT_DAY"
+MODEL_APPLICABILITY_FROZEN = "FROZEN_DAY_1_2"
+MODEL_APPLICABILITY_OOD = "OOD_EVENT_DAY"
 UA = "Mozilla/5.0 BOAT-RACE-Morning-Spec-Rebuild/1.0"
+
+_source_artifacts: dict[str, dict[str, Any]] = {}
 
 
 def canonical(v: Any) -> bytes:
@@ -33,6 +39,107 @@ def canonical(v: Any) -> bytes:
 def sha(v: Any) -> str:
     b = v if isinstance(v, (bytes, bytearray)) else canonical(v)
     return hashlib.sha256(b).hexdigest()
+
+
+def reset_source_manifest() -> None:
+    _source_artifacts.clear()
+
+
+def _record_source_artifact(
+    url: str,
+    body: bytes | bytearray,
+    *,
+    retrieved_at_utc: datetime | None = None,
+) -> None:
+    if not isinstance(body, (bytes, bytearray)):
+        raise TypeError("SOURCE_ARTIFACT_BYTES_REQUIRED")
+    raw = bytes(body)
+    observed_at = retrieved_at_utc or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("SOURCE_RETRIEVAL_TIME_MUST_BE_AWARE")
+    identity = {
+        "source_url": url,
+        "content_sha256": sha(raw),
+        "byte_length": len(raw),
+    }
+    previous = _source_artifacts.get(url)
+    if previous is not None:
+        if any(previous.get(key) != value for key, value in identity.items()):
+            raise RuntimeError(f"SOURCE_BYTES_CHANGED_DURING_RUN:{url}")
+        return
+    _source_artifacts[url] = {
+        **identity,
+        "retrieved_at_utc": observed_at.astimezone(timezone.utc).isoformat(),
+    }
+
+
+def source_manifest() -> dict[str, Any]:
+    return {
+        "schema_version": SOURCE_MANIFEST_SCHEMA,
+        "artifacts": [_source_artifacts[url] for url in sorted(_source_artifacts)],
+    }
+
+
+def source_manifest_sha256() -> str:
+    manifest = source_manifest()
+    if not manifest["artifacts"]:
+        raise RuntimeError("SOURCE_MANIFEST_EMPTY")
+    return sha(manifest)
+
+
+def build_handoff_entrants(raw_entrants: Any) -> list[dict[str, Any]]:
+    """Validate and retain six entrants with complete P1/P2/P3 probabilities."""
+    positions = ("1", "2", "3")
+    if not isinstance(raw_entrants, list) or len(raw_entrants) != 6:
+        raise ValueError("HANDOFF_ENTRANTS_INVALID")
+    entrants: list[dict[str, Any]] = []
+    lanes: set[int] = set()
+    position_sums = {
+        kind: {position: 0.0 for position in positions}
+        for kind in ("market_probability", "performance_probability")
+    }
+    for raw in raw_entrants:
+        if not isinstance(raw, dict):
+            raise ValueError("HANDOFF_ENTRANTS_INVALID")
+        lane = raw.get("lane")
+        if (
+            not isinstance(lane, int)
+            or isinstance(lane, bool)
+            or lane not in range(1, 7)
+            or lane in lanes
+        ):
+            raise ValueError("HANDOFF_ENTRANTS_INVALID")
+        lanes.add(lane)
+        entrant = {
+            "lane": lane,
+            "racer_registration_no": raw["racer_no"],
+            "racer_name": raw["racer_name"],
+        }
+        for kind in ("market_probability", "performance_probability"):
+            probabilities = raw.get(kind)
+            if not isinstance(probabilities, dict) or set(probabilities) != set(positions):
+                raise ValueError("HANDOFF_PROBABILITY_INVALID")
+            normalized: dict[str, float] = {}
+            for position in positions:
+                value = probabilities[position]
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ValueError("HANDOFF_PROBABILITY_INVALID")
+                probability = float(value)
+                if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                    raise ValueError("HANDOFF_PROBABILITY_INVALID")
+                normalized[position] = probability
+                position_sums[kind][position] += probability
+            entrant[kind] = normalized
+        entrants.append(entrant)
+    if lanes != set(range(1, 7)):
+        raise ValueError("HANDOFF_ENTRANTS_INVALID")
+    for sums in position_sums.values():
+        if any(
+            not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9)
+            for total in sums.values()
+        ):
+            raise ValueError("HANDOFF_PROBABILITY_SUM_INVALID")
+    return sorted(entrants, key=lambda entrant: entrant["lane"])
 
 
 def softmax(xs: list[float]) -> list[float]:
@@ -73,31 +180,152 @@ class Entrant:
     pretest_rank:int|None=None; comment_score:float=0.0; comment_missing:bool=True
 
 
+@dataclass(frozen=True)
+class MeetingContext:
+    """Official target-day meeting context; unknown final-day numbers stay null."""
+
+    event_day: int | None
+    event_phase: str
+    event_day_label: str
+
+
+_FULLWIDTH_EVENT_TRANSLATION = str.maketrans(
+    "０１２３４５６７８９／－",
+    "0123456789/-",
+)
+
+
+def _target_date_scopes(text: str, target: date) -> list[tuple[str, int]]:
+    normalized = text.translate(_FULLWIDTH_EVENT_TRANSLATION)
+    date_patterns = (
+        rf"{target.year}\s*年\s*0?{target.month}\s*月\s*0?{target.day}\s*日",
+        rf"(?<!\d)0?{target.month}\s*月\s*0?{target.day}\s*日",
+        rf"(?<!\d){target.year}[/-]0?{target.month}[/-]0?{target.day}(?!\d)",
+        rf"(?<!\d){target.strftime('%Y%m%d')}(?!\d)",
+    )
+    locations: list[tuple[int, int]] = []
+    for pattern in date_patterns:
+        locations.extend(match.span() for match in re.finditer(pattern, normalized))
+    if not locations:
+        return []
+    scopes: list[tuple[str, int]] = []
+    for start_at, end_at in sorted(set(locations)):
+        start = max(0, start_at - 60)
+        end = min(len(normalized), end_at + 320)
+        scopes.append((normalized[start:end], ((start_at + end_at) // 2) - start))
+    return scopes
+
+
+_KANJI_EVENT_DAYS = {
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+    "十一": 11,
+    "十二": 12,
+}
+_EVENT_DAY_PATTERN = re.compile(
+    r"初日|最終日|"
+    r"(?<!\d)(?:第\s*)?(1[0-2]|[1-9])\s*日目(?!\d)|"
+    r"(?<!\d)第\s*(1[0-2]|[1-9])\s*日(?!\d)|"
+    r"(?:第\s*)?(十二|十一|十|[一二三四五六七八九])\s*日目|"
+    r"第\s*(十二|十一|十|[一二三四五六七八九])\s*日"
+)
+
+
+def _nearest_event_day(scope: str, anchor: int) -> tuple[int | None, str] | None:
+    matches = list(_EVENT_DAY_PATTERN.finditer(scope))
+    if not matches:
+        return None
+    match = min(
+        matches,
+        key=lambda candidate: abs(((candidate.start() + candidate.end()) // 2) - anchor),
+    )
+    token = match.group(0)
+    if token == "初日":
+        return 1, "初日"
+    if token == "最終日":
+        return None, "最終日"
+    if match.group(1) or match.group(2):
+        event_day = int(match.group(1) or match.group(2))
+    else:
+        event_day = _KANJI_EVENT_DAYS[match.group(3) or match.group(4)]
+    return event_day, f"{event_day}日目"
+
+
+def event_context_from_text(text: str, target: date) -> MeetingContext | None:
+    """Parse only the official page region bound to the requested target date."""
+
+    plain = " ".join(BeautifulSoup(text, "html.parser").stripped_strings)
+    scopes = _target_date_scopes(plain, target)
+    if not scopes:
+        return None
+
+    parsed: list[MeetingContext] = []
+    for scope, anchor in scopes:
+        day = _nearest_event_day(scope, anchor)
+        if day:
+            event_day, label = day
+            phase = "FINAL" if label == "最終日" else "REGULAR"
+            parsed.append(MeetingContext(event_day, phase, label))
+        elif "準優勝戦" in scope:
+            parsed.append(MeetingContext(None, "SEMIFINAL", "準優勝戦日"))
+        elif "優勝戦" in scope:
+            parsed.append(MeetingContext(None, "FINAL", "優勝戦日"))
+
+    if not parsed:
+        return None
+    event_days = {context.event_day for context in parsed if context.event_day is not None}
+    event_day = next(iter(event_days)) if len(event_days) == 1 else None
+    phase = "FINAL" if any(
+        context.event_phase == "FINAL" for context in parsed
+    ) else (
+        "SEMIFINAL" if any(
+            context.event_phase == "SEMIFINAL" for context in parsed
+        ) else "REGULAR"
+    )
+    if event_day is not None:
+        label = "初日" if event_day == 1 else f"{event_day}日目"
+    elif phase == "FINAL":
+        label = "最終日"
+    else:
+        label = "準優勝戦日"
+    return MeetingContext(event_day, phase, label)
+
+
 def get(url:str)->str:
     r=requests.get(url,headers={"User-Agent":UA},timeout=12)
-    r.raise_for_status(); r.encoding=r.apparent_encoding
+    r.raise_for_status()
+    _record_source_artifact(url, r.content)
+    r.encoding=r.apparent_encoding
     return r.text
 
 
 def event_day_from_text(text:str,target:date)->int|None:
-    soup=BeautifulSoup(text,"html.parser")
-    plain=" ".join(soup.stripped_strings)
-    md=f"{target.month}月{target.day}日"
-    # Prefer a local occurrence around the requested date.
-    idx=plain.find(md)
-    scope=plain[idx:idx+600] if idx>=0 else plain[:1200]
-    if "初日" in scope: return 1
-    if re.search(r"(?:２|2)日目",scope): return 2
-    return None
+    context = event_context_from_text(text, target)
+    return context.event_day if context is not None else None
 
 
-def discover(target:date)->list[tuple[int,int]]:
+def discover(
+    target: date,
+    source_failures: list[str] | None = None,
+) -> list[tuple[int, MeetingContext]]:
     ds=target.strftime("%Y%m%d"); result=[]
     for venue in range(1,25):
         try: html=get(f"https://www.boatrace.jp/owpc/pc/race/raceindex?hd={ds}&jcd={venue:02d}")
-        except Exception: continue
-        day=event_day_from_text(html,target)
-        if day in (1,2): result.append((venue,day))
+        except Exception as exc:
+            if source_failures is not None:
+                source_failures.append(f"{venue:02d}-INDEX:{type(exc).__name__}:{exc}")
+            continue
+        context = event_context_from_text(html, target)
+        if context is not None:
+            result.append((venue, context))
     return result
 
 
@@ -162,13 +390,14 @@ def extract_entrants(html:str)->list[Entrant]:
 
 
 def acquire(target:date)->tuple[list[dict[str,Any]],list[str]]:
+    reset_source_manifest()
     ds=target.strftime("%Y%m%d"); races=[]; failures=[]
-    for venue,event_day in discover(target):
+    for venue,context in discover(target, failures):
         for rno in range(1,13):
             url=f"https://www.boatrace.jp/owpc/pc/race/racelist?hd={ds}&jcd={venue:02d}&rno={rno}"
             try:
                 html=get(url); deadline=parse_deadline(html); entrants=extract_entrants(html)
-                races.append({"venue_code":venue,"race_no":rno,"event_day":event_day,"deadline_time_jst":deadline.isoformat(),"source_url":url,"entrants":[e.__dict__ for e in entrants]})
+                races.append({"venue_code":venue,"race_no":rno,"event_day":context.event_day,"event_phase":context.event_phase,"event_day_label":context.event_day_label,"deadline_time_jst":deadline.isoformat(),"source_url":url,"entrants":[e.__dict__ for e in entrants]})
             except Exception as exc: failures.append(f"{venue:02d}-{rno:02d}:{type(exc).__name__}:{exc}")
     return races,failures
 
@@ -202,7 +431,39 @@ def motor_point(e:Entrant)->tuple[float,bool]:
     return 0.0,True
 
 
+def frozen_model_event_eligible(race: dict[str, Any]) -> bool:
+    event_day = race.get("event_day")
+    return (
+        isinstance(event_day, int)
+        and not isinstance(event_day, bool)
+        and event_day in (1, 2)
+        and race.get("event_phase", "REGULAR") == "REGULAR"
+    )
+
+
+def ood_event_day_skip(race: dict[str, Any]) -> dict[str, Any]:
+    """Keep an official race auditable without applying an out-of-domain model."""
+
+    entrants = race.get("entrants")
+    if not isinstance(entrants, list) or len(entrants) != 6:
+        raise ValueError("SIX_ENTRANTS_REQUIRED")
+    return {
+        **race,
+        "signals": [],
+        "tickets": [],
+        "race_grade": "B",
+        "decision_state": "SKIP",
+        "purchase_decision": "SKIP",
+        "model_applicability": MODEL_APPLICABILITY_OOD,
+        "reason_codes": [MODEL_OOD_EVENT_DAY],
+        "feature_degraded": True,
+        "degradation_codes": [MODEL_OOD_EVENT_DAY],
+    }
+
+
 def score_race(r:dict[str,Any],v2:dict[str,Any],v21:dict[str,Any])->dict[str,Any]:
+    if not frozen_model_event_eligible(r):
+        return ood_event_day_skip(r)
     entrants=[Entrant(**x) for x in r['entrants']]
     betas=v2['models']['market']['frozen_beta']; deltas=v2['models']['performance']['base_delta']; gammas=v2['models']['performance']['evaluation_gamma']
     evals=[]; conf=[]
@@ -250,7 +511,7 @@ def score_race(r:dict[str,Any],v2:dict[str,Any],v21:dict[str,Any])->dict[str,Any
         mr={str(p):market[str(p)][i] for p in (1,2,3)}; pr={str(p):perf[str(p)][i] for p in (1,2,3)}
         entrants_out.append({"lane":e.lane,"racer_no":e.racer_no,"racer_name":e.racer_name,"racer_class":e.racer_class,"national_win":e.national_win,"pretest_point":pp,"motor_point":mp,"comment_score":e.comment_score,"evaluation_score":ev,"evidence_confidence":conf[i],"motor_recent5_missing":missing,"comment_missing":e.comment_missing,"market_probability":mr,"performance_probability":pr,"market_top3_raw":sum(mr.values()),"performance_top3_raw":sum(pr.values()),"market_top3":sum(mr.values()),"performance_top3":sum(pr.values())})
     max_strength=max((x['strength'] for x in signals),default=0.0); grade='S' if max_strength>=3 else ('A' if max_strength>=1.75 else 'B')
-    return {**r,"signals":signals,"tickets":tickets,"entrants":entrants_out,"race_grade":grade,"feature_degraded":True,"degradation_codes":["PRETEST_OPTIONAL_NEUTRAL_IF_MISSING","MOTOR_RECENT5_UNAVAILABLE","COMMENT_OPTIONAL_NEUTRAL","V21_TOP3_STRUCTURAL_OVERLAY_SUPPRESSED"]}
+    return {**r,"signals":signals,"tickets":tickets,"entrants":entrants_out,"race_grade":grade,"model_applicability":MODEL_APPLICABILITY_FROZEN,"feature_degraded":True,"degradation_codes":["PRETEST_OPTIONAL_NEUTRAL_IF_MISSING","MOTOR_RECENT5_UNAVAILABLE","COMMENT_OPTIONAL_NEUTRAL","V21_TOP3_STRUCTURAL_OVERLAY_SUPPRESSED"]}
 
 
 def dt_deadline(target:date,tstr:str)->datetime:
@@ -267,6 +528,8 @@ def create_run(cur,target:date,stage:str,scheduled:datetime)->int:
 
 
 def persist(cur,rid:int,target:date,stage:str,scored:list[dict[str,Any]],source_failures:list[str],now:datetime)->dict[str,int]:
+    source_evidence=source_manifest(); source_artifact_sha256=source_manifest_sha256()
+    scorer_artifact_sha256=sha({"schema_version":"boatrace-morning-scorer-output-manifest-v1","races":scored})
     owned=[]
     for r in scored:
         dl=dt_deadline(target,r['deadline_time_jst']); h=dl.astimezone(JST).hour
@@ -277,19 +540,19 @@ def persist(cur,rid:int,target:date,stage:str,scored:list[dict[str,Any]],source_
     for r,dl in candidates:
         payload={"schema_version":"boatrace-ux-morning-projection-v1","target_date":target.isoformat(),"stage":stage,"venue_code":r['venue_code'],"race_no":r['race_no'],"morning_grade":r['race_grade'],"deadline_time_jst":r['deadline_time_jst'],"signals":r['signals'],"tickets":r['tickets'],"entrants":r['entrants'],"feature_degraded":True,"degradation_codes":r['degradation_codes']}
         ph=sha(payload); pk=sha({"kind":"MORNING","target_date":target.isoformat(),"venue":r['venue_code'],"race":r['race_no'],"revision":1})
-        cur.execute("INSERT INTO ux_app.race_projections(projection_key,run_execution_id,revision,projection_kind,target_date,venue_code,race_no,official_deadline_at,morning_grade,canonical_decision,reason_codes,attempt_present,publishable_plan_verified,operational_code,display_state,classifier_policy_id,performance_kind,source_ref,source_artifact_sha256,payload,payload_sha256,spend_yen,projected_at,actionable_until) VALUES(%s,%s,1,'MORNING',%s,%s,%s,%s,%s,NULL,'[]'::jsonb,false,false,NULL,%s,NULL,NULL,%s,%s,%s,%s,0,clock_timestamp(),NULL) ON CONFLICT (projection_kind,target_date,venue_code,race_no,revision) DO NOTHING",(pk,rid,target,r['venue_code'],r['race_no'],dl,r['race_grade'],r['race_grade'],SOURCE_REF,sha(SOURCE_REF.encode()),Jsonb(payload),ph))
+        cur.execute("INSERT INTO ux_app.race_projections(projection_key,run_execution_id,revision,projection_kind,target_date,venue_code,race_no,official_deadline_at,morning_grade,canonical_decision,reason_codes,attempt_present,publishable_plan_verified,operational_code,display_state,classifier_policy_id,performance_kind,source_ref,source_artifact_sha256,payload,payload_sha256,spend_yen,projected_at,actionable_until) VALUES(%s,%s,1,'MORNING',%s,%s,%s,%s,%s,NULL,'[]'::jsonb,false,false,NULL,%s,NULL,NULL,%s,%s,%s,%s,0,clock_timestamp(),NULL) ON CONFLICT (projection_kind,target_date,venue_code,race_no,revision) DO NOTHING",(pk,rid,target,r['venue_code'],r['race_no'],dl,r['race_grade'],r['race_grade'],SOURCE_REF,source_artifact_sha256,Jsonb(payload),ph))
     handoffs=0
     logic='v2.1-prod-20260809-003' if stage=='EARLY' else 'v2.1-prod-reporter-20260812-004'
     for r,dl in s:
         if not r['tickets']: continue
-        entrants=[{"lane":e['lane'],"racer_registration_no":e['racer_no'],"racer_name":e['racer_name']} for e in r['entrants']]
+        entrants=build_handoff_entrants(r['entrants'])
         payload={"schema_version":"purchase-assist-handoff-v2","target_date":target.isoformat(),"venue_code":r['venue_code'],"race_no":r['race_no'],"deadline_at":dl.isoformat(),"logic_version":logic,"notification_policy":PURCHASE_POLICY,"race_grade":"S","morning_hypothesis":"Morning V2.1 frozen-spec value signal","scorer_tickets":r['tickets'],"entrants":entrants,"source_scorer_ref":SOURCE_REF}
         psha=sha(payload); hkey=sha({"target":target.isoformat(),"venue":r['venue_code'],"race":r['race_no'],"logic":logic,"source":SOURCE_REF})
-        cur.execute("INSERT INTO purchase_assist.handoffs(handoff_key,schema_version,target_date,venue_code,race_no,deadline_at,logic_version,notification_policy,source_scorer_ref,source_scorer_sha256,source_scorer_artifact_id,race_grade,morning_hypothesis,scorer_tickets,entrants,canonical_payload,payload_sha256) VALUES(%s,'purchase-assist-handoff-v2',%s,%s,%s,%s,%s,%s,%s,%s,NULL,'S',%s,%s,%s,%s,%s) ON CONFLICT (handoff_key) DO NOTHING RETURNING id",(hkey,target,r['venue_code'],r['race_no'],dl,logic,PURCHASE_POLICY,SOURCE_REF,sha(SOURCE_REF.encode()),payload['morning_hypothesis'],Jsonb(r['tickets']),Jsonb(entrants),Jsonb(payload),psha))
+        cur.execute("INSERT INTO purchase_assist.handoffs(handoff_key,schema_version,target_date,venue_code,race_no,deadline_at,logic_version,notification_policy,source_scorer_ref,source_scorer_sha256,source_scorer_artifact_id,race_grade,morning_hypothesis,scorer_tickets,entrants,canonical_payload,payload_sha256) VALUES(%s,'purchase-assist-handoff-v2',%s,%s,%s,%s,%s,%s,%s,%s,NULL,'S',%s,%s,%s,%s,%s) ON CONFLICT (handoff_key) DO NOTHING RETURNING id",(hkey,target,r['venue_code'],r['race_no'],dl,logic,PURCHASE_POLICY,SOURCE_REF,scorer_artifact_sha256,payload['morning_hypothesis'],Jsonb(r['tickets']),Jsonb(entrants),Jsonb(payload),psha))
         if cur.fetchone(): handoffs+=1
     source_state='SOURCE_OK' if not source_failures else 'PARTIAL_SOURCE'
     outcome='CANDIDATES_FOUND' if candidates else ('PARTIAL_SOURCE' if source_failures else 'NO_CANDIDATES')
-    cur.execute("INSERT INTO ux_app.run_events(run_execution_id,event_seq,event_at,lifecycle_status,outcome,source_state,history_state,feature_state,inspected_count,actionable_count,s_count,a_count,handoff_count,source_artifact_ref,source_artifact_sha256,details,finished_at) VALUES(%s,2,clock_timestamp(),'SUCCEEDED',%s,%s,'DEGRADED_HISTORY','FEATURE_DEGRADED',%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp())",(rid,outcome,source_state,len(owned),len(actionable),len(s),len(a),handoffs,SOURCE_REF,sha(SOURCE_REF.encode()),Jsonb({"stage":stage,"runner":SOURCE_REF,"full_inspected_count":len(scored),"full_actionable_count":len(actionable),"source_failures":source_failures[:100],"degraded":True,"top3_structural_overlay_suppressed":True})))
+    cur.execute("INSERT INTO ux_app.run_events(run_execution_id,event_seq,event_at,lifecycle_status,outcome,source_state,history_state,feature_state,inspected_count,actionable_count,s_count,a_count,handoff_count,source_artifact_ref,source_artifact_sha256,details,finished_at) VALUES(%s,2,clock_timestamp(),'SUCCEEDED',%s,%s,'DEGRADED_HISTORY','FEATURE_DEGRADED',%s,%s,%s,%s,%s,%s,%s,%s,clock_timestamp())",(rid,outcome,source_state,len(owned),len(actionable),len(s),len(a),handoffs,SOURCE_REF,source_artifact_sha256,Jsonb({"stage":stage,"runner":SOURCE_REF,"full_inspected_count":len(scored),"full_actionable_count":len(actionable),"source_failures":source_failures[:100],"source_manifest":source_evidence,"source_manifest_sha256":source_artifact_sha256,"source_artifact_count":len(source_evidence["artifacts"]),"scorer_artifact_sha256":scorer_artifact_sha256,"degraded":True,"top3_structural_overlay_suppressed":True})))
     return {"inspected":len(owned),"actionable":len(actionable),"s":len(s),"a":len(a),"handoff":handoffs}
 
 

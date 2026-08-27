@@ -199,14 +199,21 @@ jobs:
                 runner.py \
                 production.py \
                 audit_overlay.py \
+                late_diff.py \
                 run_with_digest.py \
                 stage_guard.py \
                 stage_lock.py \
                 delivery_gate.py \
                 verify_runtime_manifest.py \
+                test_digest_wrapper.py \
+                test_handoff_probabilities.py \
+                test_late_diff.py \
+                test_p4_integrity.py \
+                test_p5_event_day_ood.py \
                 test_runtime_hardening.py && \
               python verify_runtime_manifest.py --manifest runtime_manifest.json && \
-              python -m unittest -q test_runtime_hardening.py
+              python -m unittest discover -v -p 'test_*.py' && \
+              python test_digest_wrapper.py
             ) > "$LOG" 2>&1
             CODE=$?
             set -e
@@ -292,7 +299,12 @@ jobs:
               CODE=$DELIVERY_CODE
               DISPOSITION=DELIVERY_GATE_FAILED
             else
-              DISPOSITION=PASS_DELIVERED
+              DELIVERY_STATUS="$(jq -r '.status' "$DELIVERY_EVIDENCE")"
+              case "$DELIVERY_STATUS" in
+                PASS_SUPPRESSED) DISPOSITION=PASS_SUPPRESSED ;;
+                PASS_DEDUPLICATED) DISPOSITION=PASS_DEDUPLICATED ;;
+                *) DISPOSITION=PASS_DELIVERED ;;
+              esac
             fi
           elif [ "$CODE" -eq 0 ] && [ "$VERIFY_EXISTING" = true ]; then
             set +e
@@ -311,7 +323,18 @@ jobs:
             else
               RUN_ID="$(jq -r '.run_execution_id // empty' "$DELIVERY_EVIDENCE")"
               EXPECTED_SKIP_COUNT="$(jq -r '.expected_skip_count // empty' "$DELIVERY_EVIDENCE")"
-              DISPOSITION=SKIPPED_ALREADY_STARTED_DELIVERY_VERIFIED
+              DELIVERY_STATUS="$(jq -r '.status' "$DELIVERY_EVIDENCE")"
+              case "$DELIVERY_STATUS" in
+                PASS_SUPPRESSED)
+                  DISPOSITION=SKIPPED_ALREADY_STARTED_SUPPRESSION_VERIFIED
+                  ;;
+                PASS_DEDUPLICATED)
+                  DISPOSITION=SKIPPED_ALREADY_STARTED_DEDUPLICATION_VERIFIED
+                  ;;
+                *)
+                  DISPOSITION=SKIPPED_ALREADY_STARTED_DELIVERY_VERIFIED
+                  ;;
+              esac
             fi
           fi
 
@@ -346,7 +369,9 @@ jobs:
               'expected_skip_count': int(os.environ['EXPECTED_SKIP_COUNT']) if os.environ.get('EXPECTED_SKIP_COUNT') else None,
               'stage_lock': json.loads(lock_path.read_text()) if lock_path.is_file() else None,
               'delivery_gate': json.loads(delivery_path.read_text()) if delivery_path.is_file() else None,
-              'runtime_contract_version': 'morning-prod-hardening-20260825-001',
+              'runtime_contract_version': Path(
+                  'ops/boatrace-morning-free/runtime/version.txt'
+              ).read_text(encoding='utf-8').strip(),
               'event_name': os.environ.get('GITHUB_EVENT_NAME'),
               'event_schedule': os.environ.get('EVENT_SCHEDULE') or None,
               'source_commit_sha': os.environ.get('SOURCE_COMMIT_SHA'),
