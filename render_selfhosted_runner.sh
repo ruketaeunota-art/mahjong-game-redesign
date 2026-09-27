@@ -18,6 +18,37 @@ if [[ -z "${RUNNER_TOKEN:-}" || "${RUNNER_TOKEN}" == "PENDING" ]]; then
   while true; do sleep 300; done
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+  GH_ROOT="$PWD/.gh-cli"
+  mkdir -p "$GH_ROOT"
+  python3 - "$GH_ROOT" <<'PY'
+import json, pathlib, shutil, sys, tarfile, tempfile, urllib.request
+root = pathlib.Path(sys.argv[1])
+req = urllib.request.Request(
+    "https://api.github.com/repos/cli/cli/releases/latest",
+    headers={"Accept": "application/vnd.github+json", "User-Agent": "render-selfhosted-runner"},
+)
+with urllib.request.urlopen(req) as r:
+    release = json.load(r)
+asset = next(
+    a for a in release["assets"]
+    if a["name"].endswith("_linux_amd64.tar.gz")
+)
+with tempfile.TemporaryDirectory() as td:
+    archive = pathlib.Path(td) / asset["name"]
+    urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    with tarfile.open(archive, "r:gz") as tf:
+        tf.extractall(td)
+    gh = next(pathlib.Path(td).glob("gh_*/bin/gh"))
+    shutil.copy2(gh, root / "gh")
+(root / "gh").chmod(0o755)
+print("GH_CLI_READY", release["tag_name"])
+PY
+  export PATH="$GH_ROOT:$PATH"
+fi
+
+gh --version | head -n 1
+
 cd .actions-runner
 export RUNNER_ALLOW_RUNASROOT=1
 RUNNER_NAME="${RUNNER_NAME_PREFIX}-$(hostname)"
