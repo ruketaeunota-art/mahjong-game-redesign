@@ -31,8 +31,7 @@ rm -f .runner .runner_migrated .credentials .credentials_migrated .credentials_r
   --work _work \
   --labels "${RUNNER_LABELS}" \
   --unattended \
-  --replace \
-  --ephemeral
+  --replace
 
 echo "SELF_HOSTED_RUNNER_CONFIGURED name=${RUNNER_NAME} labels=${RUNNER_LABELS}"
 exec ./run.sh
