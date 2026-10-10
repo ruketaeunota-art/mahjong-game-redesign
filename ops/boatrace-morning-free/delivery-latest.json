@@ -1,28 +1,28 @@
 {
-  "attempts": 18,
+  "attempts": 6,
   "error_code": null,
   "error_type": null,
   "expected_skip_count": 0,
   "legacy_run": true,
-  "recorded_at_utc": "2026-10-09T02:06:04.341543+00:00",
-  "run_execution_id": 97,
+  "recorded_at_utc": "2026-10-10T01:55:04.535135+00:00",
+  "run_execution_id": 99,
   "schema_version": "boatrace-morning-delivery-gate-v3",
   "snapshot": {
-    "canonical_run_execution_id": 97,
+    "canonical_run_execution_id": 99,
     "deduplicated": true,
     "inserted": false,
     "logical_stage": "EARLY",
-    "logical_target_date": "2026-10-09",
-    "outbox_id": 110,
-    "payload_sha256": "5c3b785f2e9d68d8931183f1ee17e83daec36614bf4eeedc86ef3bf9e8a8d971",
+    "logical_target_date": "2026-10-10",
+    "outbox_id": 112,
+    "payload_sha256": "3f98755303583e8520048ab79a8cc7af72e87c0a4a113a6dea1126204ec3798e",
     "presentation": "MORNING_CARD_V1",
-    "run_execution_id": 97,
+    "run_execution_id": 99,
     "schema_version": "boatrace-morning-digest-outbox-result-v3",
     "status": "ACCEPTED",
     "ui_version": "MORNING_USER_CARD_V2"
   },
   "stage": "EARLY",
-  "started_at_utc": "2026-10-09T02:05:28.443487+00:00",
+  "started_at_utc": "2026-10-10T01:54:53.272857+00:00",
   "status": "PASS_ACCEPTED_LEGACY",
-  "target_date": "2026-10-09"
+  "target_date": "2026-10-10"
 }
