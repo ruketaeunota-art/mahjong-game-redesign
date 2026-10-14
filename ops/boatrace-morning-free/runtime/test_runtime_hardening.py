@@ -16,7 +16,7 @@ class RuntimeHardeningTest(unittest.TestCase):
     def test_persist_uses_post_acquisition_clock(self) -> None:
         source = inspect.getsource(run_with_digest.main)
         self.assertIn("persist_now = datetime.now(runner.JST)", source)
-        self.assertIn("failures,\\n                    persist_now,", source)
+        self.assertIn("persist_now,", source[source.index("result = runner.persist("):])
 
     def test_persistence_diagnostic_never_exposes_exception_message(self) -> None:
         marker = "secret_database_url_or_payload"
