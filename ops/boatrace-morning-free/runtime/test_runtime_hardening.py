@@ -1,14 +1,36 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import date
 
 import delivery_gate
+import run_with_digest
 import stage_guard
 import stage_lock
 
 
 class RuntimeHardeningTest(unittest.TestCase):
+
+    def test_persistence_diagnostic_never_exposes_exception_message(self) -> None:
+        marker = "secret_database_url_or_payload"
+        metadata = run_with_digest._persistence_error_metadata(ValueError(marker))
+        self.assertEqual(metadata["exception_chain"], ["ValueError"])
+        self.assertIsNone(metadata["sqlstate"])
+        self.assertIsNone(metadata["constraint"])
+        self.assertNotIn(marker, json.dumps(metadata))
+
+    def test_persistence_diagnostic_reaches_safe_root_cause(self) -> None:
+        try:
+            try:
+                raise ValueError("private_payload")
+            except ValueError as cause:
+                raise RuntimeError("generic error") from cause
+        except RuntimeError as exc:
+            metadata = run_with_digest._persistence_error_metadata(exc)
+        self.assertEqual(metadata["exception_chain"], ["RuntimeError", "ValueError"])
+        self.assertNotIn("private_payload", json.dumps(metadata))
+
     def test_stage_lock_identity_is_stable_and_stage_specific(self) -> None:
         target = date(2026, 8, 26)
         early = stage_lock.lock_identity(target, "EARLY")
