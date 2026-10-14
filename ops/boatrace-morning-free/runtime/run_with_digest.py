@@ -14,6 +14,41 @@ import audit_overlay  # noqa: F401  # installs skip-audit persistence overlay
 
 _original_persist = runner.persist
 
+
+# Diagnostics intentionally include only stable codes, never raw exception text,
+# SQL parameters, connection URLs, official-source HTML or notification payloads.
+_PERSIST_PHASE = 'NOT_STARTED'
+
+
+def _persistence_error_metadata(exc: BaseException) -> dict[str, Any]:
+    causes = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(causes) < 5:
+        seen.add(id(current))
+        causes.append(type(current).__name__)
+        if isinstance(current, runner.psycopg.Error):
+            state = getattr(current, 'sqlstate', None)
+            constraint = getattr(getattr(current, 'diag', None), 'constraint_name', None)
+            return {
+                'exception_chain': causes,
+                'sqlstate': state if isinstance(state, str) and re.fullmatch(r'[A-Z0-9]{5}', state) else None,
+                'constraint': constraint if isinstance(constraint, str) and re.fullmatch(r'[A-Za-z0-9_]{1,90}', constraint) else None,
+            }
+        current = current.__cause__ or current.__context__
+    return {'exception_chain': causes, 'sqlstate': None, 'constraint': None}
+
+
+def _emit_persistence_diagnostic(exc: BaseException, *, stage: str, run_id: int) -> None:
+    print(json.dumps({
+        'event': 'MORNING_PERSISTENCE_DIAGNOSTIC_V1',
+        'stage': stage,
+        'run_id': run_id,
+        'phase': _PERSIST_PHASE,
+        **_persistence_error_metadata(exc),
+    }, ensure_ascii=False, sort_keys=True), flush=True)
+
+
 _ACTIVE_OUTBOX_STATUSES = {'QUEUED', 'LEASED', 'RETRY', 'ACCEPTED'}
 _DEDUPLICATED_TERMINAL_OUTBOX_STATUSES = {'FAILED', 'EXPIRED', 'SUPPRESSED'}
 
@@ -168,6 +203,8 @@ def persist_with_digest(
     now: datetime,
 ) -> dict[str, Any]:
     """Persist the terminal run state and its LINE digest in one transaction."""
+    global _PERSIST_PHASE
+    _PERSIST_PHASE = 'AUDIT_AND_RUN_EVENT'
     result = _original_persist(
         cur,
         rid,
@@ -184,6 +221,7 @@ def persist_with_digest(
         raise RuntimeError('MORNING_EVALUATION_INPUT_MISSING')
     if not isinstance(v2_digest_enabled, bool):
         raise RuntimeError('MORNING_DIGEST_CAPABILITY_RESULT_MISSING')
+    _PERSIST_PHASE = 'DIGEST_APPEND'
     if v2_digest_enabled:
         cur.execute(
             "SELECT ux_app.append_morning_digest_v2(%s,%s)",
@@ -208,6 +246,7 @@ def persist_with_digest(
             raise RuntimeError('MORNING_DIGEST_V1_APPEND_RESULT_MISSING')
         raw_digest = row[0]
 
+    _PERSIST_PHASE = 'DIGEST_RESULT_VALIDATION'
     digest = _validate_outbox_result(
         raw_digest,
         expected_kind='MORNING_DIGEST',
@@ -455,7 +494,8 @@ def main() -> int:
                     failures,
                     now,
                 )
-            except Exception:
+            except Exception as exc:
+                _emit_persistence_diagnostic(exc, stage=args.stage, run_id=rid)
                 # A statement failure is known to have rolled back, so the
                 # committed RUNNING identity may receive its one failure plan.
                 conn.rollback()
