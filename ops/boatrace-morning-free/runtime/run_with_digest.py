@@ -484,6 +484,10 @@ def main() -> int:
                 )
                 return 1
 
+            # Acquisition can take tens of minutes. Recheck the real clock
+            # immediately before freezing actionable races and notifications.
+            # Never treat the acquisition-start timestamp as a decision time.
+            persist_now = datetime.now(runner.JST)
             try:
                 result = runner.persist(
                     cur,
@@ -492,7 +496,7 @@ def main() -> int:
                     args.stage,
                     scored,
                     failures,
-                    now,
+                    persist_now,
                 )
             except Exception as exc:
                 _emit_persistence_diagnostic(exc, stage=args.stage, run_id=rid)
