@@ -6,7 +6,7 @@
     "late_diff.py": "f1ce8ee47803dd162119b725dd292b08e51a3e96cac05f3438364ca6e10977ac",
     "production.py": "23f72bd6cacc4e61b7522ec55f871bbcf5f369b030c6df9ca8c5c974b1cab1ae",
     "requirements.txt": "eac7173328816790cee3e79d7fae812307214492563290df37cebf886cc64b66",
-    "run_with_digest.py": "3e744174e1608f4e973bd9c003545103c48381dfc477a250c189b69d9bc949d4",
+    "run_with_digest.py": "e87669292e81baea2cc29346c0bbbfabedc5c5d708e6055b81c3452f17d911fb",
     "runner.py": "4452d715a2ec747e2dcf9c4324d378899ce5a0bd194971f5fe07beaedb9b6229",
     "stage_guard.py": "b580ba884c16fb0c6daa0a718bc5bfe4ea90d25f70d4c3b317e450f96e27fc0b",
     "stage_lock.py": "dc7c420f2a40bdbea296552402f9f951d1b8aedb06f567c8df714751c6b49324",
@@ -15,7 +15,7 @@
     "test_late_diff.py": "27968e8e6266ea410025587ed6b9cfbeb3311846f9ff8cf7a61e64aedd6fcb86",
     "test_p4_integrity.py": "0f0a36678b35552c2cda8ba4e9d3d3857cde1f1eaea5201110aef83fedf5a825",
     "test_p5_event_day_ood.py": "ebfc5f9f0edf7522890f39345ecb9abd7be98d930ae9a7c6fcefbac04b6228d8",
-    "test_runtime_hardening.py": "92151ee5c83676d5f12258c884cda1d2a6c9ac351a67392f5d9be0fb598d1cb0",
+    "test_runtime_hardening.py": "cb4c62ea1e2bfa2c6c1f438be3e1f1daa0ec7a4bb311642302d03a8df74a3c30",
     "verify_runtime_manifest.py": "33cf44fccf4eb19af77f3eee84f337dfa404d5f2053683f04601d9b6c96770a0",
     "version.txt": "0344be638af198e55fa4ac88bd47e91520bdad51d6bb0ca6a1631e2dce138390"
   },
