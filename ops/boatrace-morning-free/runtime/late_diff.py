@@ -426,61 +426,43 @@ def _compare_legacy_with_accepted_early(
         (f"morning-late-diff-v1:{target_text}:self:LINE",),
     )
     cur.fetchone()
+    # The Morning role has intentionally NO table SELECT on notification_outbox.
+    # SECURITY DEFINER returns only stage existence, baseline digest identity
+    # and the four semantic proof fields, not full notification payloads.
     cur.execute(
-        """
-        SELECT outbox.id
-        FROM ux_app.notification_outbox AS outbox
-        JOIN ux_app.run_executions AS owner_run
-          ON owner_run.id = outbox.run_execution_id
-        WHERE owner_run.target_date = %s
-          AND owner_run.stage = 'LATE'
-          AND outbox.event_kind = 'MORNING_DIGEST'
-          AND outbox.channel = 'LINE'
-          AND outbox.recipient_key = 'self'
-        ORDER BY outbox.id
-        LIMIT 1
-        FOR SHARE OF outbox
-        """,
+        "SELECT ux_app.morning_late_diff_context_v1(%s)",
         (target_date,),
     )
-    if cur.fetchone() is not None:
+    row = cur.fetchone()
+    if (
+        row is None
+        or not isinstance(row[0], dict)
+        or row[0].get("schema_version") != "morning-late-diff-context-v1"
+        or not isinstance(row[0].get("late_outbox_exists"), bool)
+    ):
+        raise RuntimeError("MORNING_LATE_DIFF_CONTEXT_INVALID")
+    context = row[0]
+    if context["late_outbox_exists"]:
         return _not_suppressed("LATE_OUTBOX_EXISTS")
     if current_semantics is None:
         return _not_suppressed("CURRENT_SEMANTICS_MISSING")
-    cur.execute(
-        """
-        SELECT owner_run.id,
-               outbox.id,
-               outbox.status,
-               btrim(outbox.payload_sha256::text),
-               terminal.details
-        FROM ux_app.notification_outbox AS outbox
-        JOIN ux_app.run_executions AS owner_run
-          ON owner_run.id = outbox.run_execution_id
-        JOIN LATERAL (
-            SELECT event.lifecycle_status, event.details
-            FROM ux_app.run_events AS event
-            WHERE event.run_execution_id = owner_run.id
-            ORDER BY event.event_seq DESC
-            LIMIT 1
-        ) AS terminal ON true
-        WHERE owner_run.target_date = %s
-          AND owner_run.stage = 'EARLY'
-          AND terminal.lifecycle_status = 'SUCCEEDED'
-          AND outbox.event_kind = 'MORNING_DIGEST'
-          AND outbox.channel = 'LINE'
-          AND outbox.recipient_key = 'self'
-          AND outbox.status = 'ACCEPTED'
-        ORDER BY outbox.id
-        LIMIT 1
-        FOR SHARE OF outbox
-        """,
-        (target_date,),
-    )
-    baseline = cur.fetchone()
+    baseline = context.get("early_baseline")
     if baseline is None:
         return _not_suppressed("ACCEPTED_EARLY_BASELINE_MISSING")
-    baseline_run_id, baseline_outbox_id, baseline_status, payload_sha, details = baseline
+    if not isinstance(baseline, dict):
+        raise RuntimeError("MORNING_LATE_DIFF_BASELINE_INVALID")
+    baseline_run_id = baseline.get("run_execution_id")
+    baseline_outbox_id = baseline.get("outbox_id")
+    baseline_status = baseline.get("status")
+    payload_sha = baseline.get("payload_sha256")
+    details = baseline.get("semantic_details")
+    if (
+        not isinstance(baseline_run_id, int)
+        or baseline_run_id <= 0
+        or not isinstance(baseline_outbox_id, int)
+        or baseline_outbox_id <= 0
+    ):
+        raise RuntimeError("MORNING_LATE_DIFF_BASELINE_IDENTITY_INVALID")
     baseline_semantics = _validated_legacy_details(details)
     if baseline_semantics is None:
         return _not_suppressed("BASELINE_SEMANTICS_MISSING")

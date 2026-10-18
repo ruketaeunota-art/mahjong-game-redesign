@@ -98,6 +98,20 @@ class _LegacyCursor:
             return (None,)
         if "SELECT execution.target_date" in self.last_sql:
             return self.current
+        if "morning_late_diff_context_v1" in self.last_sql:
+            early = None
+            if self.baseline is not None:
+                run_id, outbox_id, status, payload_sha, details = self.baseline
+                early = {
+                    "run_execution_id": run_id, "outbox_id": outbox_id,
+                    "status": status, "payload_sha256": payload_sha,
+                    "semantic_details": details,
+                }
+            return ({
+                "schema_version": "morning-late-diff-context-v1",
+                "late_outbox_exists": self.late_outbox is not None,
+                "early_baseline": early,
+            },)
         if "owner_run.stage = 'LATE'" in self.last_sql:
             return self.late_outbox
         if "owner_run.stage = 'EARLY'" in self.last_sql:
@@ -237,6 +251,8 @@ class LegacySemanticTest(unittest.TestCase):
         self.assertTrue(any(
             "pg_advisory_xact_lock" in sql for sql in cursor.calls
         ))
+        self.assertTrue(any("morning_late_diff_context_v1" in sql for sql in cursor.calls))
+        self.assertFalse(any("FROM ux_app.notification_outbox" in sql for sql in cursor.calls))
 
     def test_any_unchanged_s_a_fails_open_even_without_ticket(self) -> None:
         semantic = _semantics(_evaluations([
